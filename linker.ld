@@ -27,4 +27,8 @@ SECTIONS
     . = ALIGN(16);
     . += 0x4000;
     _stack_top = .;
+
+    . = ALIGN(16);
+    __heap_start = .;
+    __heap_end = 0x3B400000;  /* ~948MB, below MMIO at 0xFC000000 */
 }

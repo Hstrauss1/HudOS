@@ -55,9 +55,36 @@
 //   bit 3 = CNTVIRQ (virtual timer)
 #define LOCAL_TIMER_HP_IRQ      (1 << 2) //hypervisor physical timer (EL2)
 
+// GIC-400 (BCM2711, used by QEMU raspi4b for interrupt routing)
+#define GIC_BASE        0xFF841000UL
+#define GICD_CTLR       (*(volatile unsigned int *)(GIC_BASE + 0x000))  //distributor control
+#define GICD_IGROUPR(n)   (*(volatile unsigned int *)(GIC_BASE + 0x080 + (n)*4)) //interrupt group
+#define GICD_ISENABLER(n) (*(volatile unsigned int *)(GIC_BASE + 0x100 + (n)*4)) //set-enable
+#define GICD_ICENABLER(n) (*(volatile unsigned int *)(GIC_BASE + 0x180 + (n)*4)) //clear-enable
+#define GICD_ISPENDR(n)   (*(volatile unsigned int *)(GIC_BASE + 0x200 + (n)*4)) //set-pending
+#define GICD_IPRIORITYR(n) (*(volatile unsigned int *)(GIC_BASE + 0x400 + (n)*4)) //priority
+#define GICD_ITARGETSR(n)  (*(volatile unsigned int *)(GIC_BASE + 0x800 + (n)*4)) //target CPU
+#define GICC_BASE       0xFF842000UL
+#define GICC_CTLR       (*(volatile unsigned int *)(GICC_BASE + 0x000))  //CPU interface control
+#define GICC_PMR        (*(volatile unsigned int *)(GICC_BASE + 0x004))  //priority mask
+#define GICC_IAR        (*(volatile unsigned int *)(GICC_BASE + 0x00C))  //interrupt acknowledge
+#define GICC_EOIR       (*(volatile unsigned int *)(GICC_BASE + 0x010))  //end of interrupt
+
+// PPI interrupt IDs for ARM generic timers
+#define GIC_PPI_HP_TIMER  26  // hypervisor physical timer
+
 // UART0 PL011 interrupt registers
 #define UART0_IMSC  (*(volatile unsigned int *)(UART0_BASE + 0x38)) //interrupt mask set/clear
 #define UART0_MIS   (*(volatile unsigned int *)(UART0_BASE + 0x40)) //masked interrupt status
+
+// Mailbox (VideoCore communication, BCM2711 section 3)
+#define MBOX_BASE       0xFE00B880UL
+#define MBOX_READ       (*(volatile unsigned int *)(MBOX_BASE + 0x00))
+#define MBOX_STATUS     (*(volatile unsigned int *)(MBOX_BASE + 0x18))
+#define MBOX_WRITE      (*(volatile unsigned int *)(MBOX_BASE + 0x20))
+#define MBOX_FULL       0x80000000
+#define MBOX_EMPTY      0x40000000
+#define MBOX_CH_PROP    8  // property tags (ARM to VC)
 
 // GPIO function select values
 #define GPIO_FUNC_INPUT  0

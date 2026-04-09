@@ -20,4 +20,7 @@ void irq_disable(int irq);
 // called from vectors.S on IRQ entry - dispatches to registered handlers
 void irq_handler(void);
 
+// dump GIC and timer state for debugging
+void irq_dump_gic(void);
+
 #endif

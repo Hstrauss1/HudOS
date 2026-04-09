@@ -1,7 +1,6 @@
 // Hudson Strauss
 // AArch64 exception vector table
 // 16 entries, 0x80 bytes each, 0x800-aligned
-// Groups: current EL SP0, current EL SPx, lower EL AArch64, lower EL AArch32
 
 .macro VECTOR_ENTRY label
 .balign 0x80
@@ -62,7 +61,7 @@
 .global exception_vector_table
 exception_vector_table:
 
-// --- current EL with SP0 (not used, we use SPx) ---
+// --- current EL with SP0 ---
 VECTOR_ENTRY curr_el_sp0_sync
     SAVE_CONTEXT
     mov x0, #0
@@ -90,7 +89,7 @@ VECTOR_ENTRY curr_el_sp0_serror
     bl  exception_handler
     b   halt
 
-// --- current EL with SPx (this is what fires) ---
+// --- current EL with SPx (this is what fires for kernel code) ---
 VECTOR_ENTRY curr_el_spx_sync
     SAVE_CONTEXT
     mov x0, #0
@@ -118,9 +117,31 @@ VECTOR_ENTRY curr_el_spx_serror
     bl  exception_handler
     b   halt
 
-// --- lower EL using AArch64 ---
+// --- lower EL using AArch64 (SVC lands here) ---
 VECTOR_ENTRY lower_el_a64_sync
     SAVE_CONTEXT
+    // check if this is an SVC (ESR EC = 0x15)
+    mrs x3, ESR_EL2
+    lsr x4, x3, #26
+    cmp x4, #0x15
+    b.ne lower_sync_not_svc
+    // SVC: x8 = syscall number, x0-x2 = args (saved on stack)
+    ldp x0, x1, [sp, #0]       // original x0, x1
+    ldr x2, [sp, #16]          // original x2
+    ldr x3, [sp, #64]          // original x8 = syscall num
+    // syscall_handler(num, arg0, arg1, arg2)
+    mov x4, x0                 // save arg0
+    mov x0, x3                 // num
+    mov x3, x2                 // arg2
+    mov x2, x1                 // arg1
+    mov x1, x4                 // arg0
+    bl  syscall_handler
+    // store return value in saved x0
+    str x0, [sp, #0]
+    RESTORE_CONTEXT
+    eret
+
+lower_sync_not_svc:
     mov x0, #0
     mov x1, sp
     bl  exception_handler

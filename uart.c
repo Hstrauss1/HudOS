@@ -75,6 +75,104 @@ void uart_puthex(unsigned long val){
 	}
 }
 
+// --- kprintf: formatted output ---
+
+// helper: print unsigned decimal
+static void print_unsigned(unsigned long val){
+	char buf[20];
+	int i = 0;
+	if(val == 0){
+		uart_putc('0');
+		return;
+	}
+	while(val > 0){
+		buf[i++] = '0' + (val % 10);
+		val /= 10;
+	}
+	while(i > 0) uart_putc(buf[--i]);
+}
+
+// helper: print signed decimal
+static void print_signed(long val){
+	if(val < 0){
+		uart_putc('-');
+		val = -val;
+	}
+	print_unsigned((unsigned long)val);
+}
+
+// helper: print hex with 0x prefix
+static void print_hex(unsigned long val){
+	uart_putc('0');
+	uart_putc('x');
+	int started = 0;
+	for(int shift = 60; shift >= 0; shift -= 4){
+		int nibble = (val >> shift) & 0xF;
+		if(nibble || started || shift == 0){
+			started = 1;
+			uart_putc(nibble < 10 ? '0' + nibble : 'A' + nibble - 10);
+		}
+	}
+}
+
+// minimal variadic printf using __builtin_va_*
+void kprintf(const char *fmt, ...){
+	__builtin_va_list ap;
+	__builtin_va_start(ap, fmt);
+
+	while(*fmt){
+		if(*fmt != '%'){
+			if(*fmt == '\n') uart_putc('\r');
+			uart_putc(*fmt++);
+			continue;
+		}
+		fmt++; // skip '%'
+		switch(*fmt){
+			case 'd': {
+				long val = __builtin_va_arg(ap, long);
+				print_signed(val);
+				break;
+			}
+			case 'u': {
+				unsigned long val = __builtin_va_arg(ap, unsigned long);
+				print_unsigned(val);
+				break;
+			}
+			case 'x': {
+				unsigned long val = __builtin_va_arg(ap, unsigned long);
+				print_hex(val);
+				break;
+			}
+			case 'p': {
+				void *val = __builtin_va_arg(ap, void *);
+				print_hex((unsigned long)val);
+				break;
+			}
+			case 's': {
+				const char *s = __builtin_va_arg(ap, const char *);
+				if(!s) s = "(null)";
+				uart_puts(s);
+				break;
+			}
+			case 'c': {
+				int c = __builtin_va_arg(ap, int);
+				uart_putc((char)c);
+				break;
+			}
+			case '%':
+				uart_putc('%');
+				break;
+			default:
+				uart_putc('%');
+				uart_putc(*fmt);
+				break;
+		}
+		fmt++;
+	}
+
+	__builtin_va_end(ap);
+}
+
 // enable UART RX interrupt (bit 4 = RXIM)
 void uart_irq_enable(void){
 	UART0_IMSC |= (1 << 4);

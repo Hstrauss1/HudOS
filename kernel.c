@@ -21,6 +21,9 @@
 #include "panic.h"
 #include "user.h"
 #include "syscall.h"
+#include "version.h"
+#include "test.h"
+#include "home.h"
 
 // skip past the current argument to the next space-separated one
 static const char *next_arg(const char *s){
@@ -33,45 +36,66 @@ static const char *next_arg(const char *s){
 
 static void help_command(){
 	uart_puts("Commands:\n");
+	uart_puts("\n[system]\n");
 	uart_puts("  help                show this message\n");
-	uart_puts("  info                about this OS\n");
+	uart_puts("  info                version and build info\n");
 	uart_puts("  why                 why I built this\n");
 	uart_puts("  clear               clear screen\n");
 	uart_puts("  echo <text>         print text\n");
-	uart_puts("  led <pin> <on/off>  set GPIO pin\n");
-	uart_puts("  blink <pin>         blink GPIO 5 times\n");
-	uart_puts("  readpin <pin>       read GPIO pin state\n");
-	uart_puts("  uptime              time since boot\n");
 	uart_puts("  el                  show exception level\n");
+	uart_puts("  uptime              time since boot\n");
 	uart_puts("  panic               trigger kernel panic\n");
 	uart_puts("  crashtest <type>    null/assert/brk/undef/align\n");
+	uart_puts("\n[gpio]\n");
+	uart_puts("  led <pin> <on/off>  set GPIO pin output\n");
+	uart_puts("  blink <pin>         blink GPIO pin 5 times\n");
+	uart_puts("  readpin <pin>       read GPIO pin state\n");
+	uart_puts("\n[timer/irq]\n");
 	uart_puts("  ticks               show timer IRQ count\n");
 	uart_puts("  irqtest             count IRQs over 3s\n");
 	uart_puts("  timerdbg            dump GIC/timer state\n");
+	uart_puts("\n[memory]\n");
 	uart_puts("  peek <addr>         read 32-bit value at hex address\n");
 	uart_puts("  poke <addr> <val>   write 32-bit hex value to address\n");
 	uart_puts("  dump <addr> [n]     dump n words (default 8)\n");
 	uart_puts("  heapinfo            show allocator state\n");
 	uart_puts("  malloc <size>       test allocate bytes\n");
 	uart_puts("  free <addr>         free allocated memory\n");
+	uart_puts("\n[tasks]\n");
 	uart_puts("  tasks               list running tasks\n");
 	uart_puts("  spawn               spawn a background counter task\n");
 	uart_puts("  kill <id>           kill a task by ID\n");
 	uart_puts("  sleep <ms>          sleep current task for ms\n");
 	uart_puts("  yield               yield to next task\n");
 	uart_puts("  uspawn              spawn a user-mode demo task (EL1)\n");
-	uart_puts("  fbtest              draw test pattern on framebuffer\n");
+	uart_puts("\n[ipc/sync]\n");
 	uart_puts("  locktest            test spinlock primitives\n");
 	uart_puts("  semtest             producer/consumer semaphore demo\n");
 	uart_puts("  mqtest              message queue ping-pong demo\n");
 	uart_puts("  mutextest           mutex shared counter demo\n");
+	uart_puts("\n[filesystem]\n");
 	uart_puts("  mkfile <name>       create a ramfs file\n");
 	uart_puts("  write <name> <data> write data to file\n");
 	uart_puts("  cat <name>          read file contents\n");
 	uart_puts("  ls                  list ramfs files\n");
+	uart_puts("\n[framebuffer]\n");
+	uart_puts("  fbtest              draw test pattern on framebuffer\n");
+	uart_puts("  fbmirror            toggle horizontal mirror (QEMU fix)\n");
+	uart_puts("  home                launch live desktop (auto-updates)\n");
+	uart_puts("  home stop           close the desktop\n");
+	uart_puts("\n[self-tests]\n");
+	uart_puts("  test_uart           test UART and string library\n");
+	uart_puts("  test_gpio           test GPIO driver\n");
+	uart_puts("  test_timer          test timer driver\n");
+	uart_puts("  test_alloc          test memory allocator\n");
+	uart_puts("  test_all            run all self-tests\n");
 }
 static void info_command(){
-	uart_puts("This is a bare metal OS coded in C and like a little assembly.\n");
+	kprintf("%s v%s\n", HUDOS_NAME, HUDOS_VERSION);
+	kprintf("Arch:   %s running at %s\n", HUDOS_ARCH, HUDOS_EL);
+	kprintf("Board:  %s\n", HUDOS_BOARD);
+	kprintf("Author: %s\n", HUDOS_AUTHOR);
+	kprintf("Built:  %s %s\n", __DATE__, __TIME__);
 }
 static void why_command(){
 	uart_puts("I wanted to get better at actually coding, I know most theory but have bad impl. skills\n");
@@ -630,6 +654,45 @@ static void ls_command(){
 	}
 }
 
+// --- self-test commands ---
+
+static void test_uart_command(void){
+	int r = test_uart();
+	if(r == 0) kprintf("test_uart: PASSED\n");
+	else        kprintf("test_uart: %d FAILURE(S)\n", r);
+}
+
+static void test_gpio_command(void){
+	int r = test_gpio();
+	if(r == 0) kprintf("test_gpio: PASSED\n");
+	else        kprintf("test_gpio: %d FAILURE(S)\n", r);
+}
+
+static void test_timer_command(void){
+	int r = test_timer();
+	if(r == 0) kprintf("test_timer: PASSED\n");
+	else        kprintf("test_timer: %d FAILURE(S)\n", r);
+}
+
+static void test_alloc_command(void){
+	int r = test_alloc();
+	if(r == 0) kprintf("test_alloc: PASSED\n");
+	else        kprintf("test_alloc: %d FAILURE(S)\n", r);
+}
+
+static void test_all_command(void){
+	int total = 0;
+	kprintf("Running all self-tests...\n");
+	total += test_uart();
+	total += test_gpio();
+	total += test_timer();
+	total += test_alloc();
+	kprintf("==============================\n");
+	if(total == 0) kprintf("ALL TESTS PASSED\n");
+	else            kprintf("TOTAL FAILURES: %d\n", total);
+	kprintf("==============================\n");
+}
+
 static void command_error(){
 	uart_puts("unrecognized command\n");
 }
@@ -693,6 +756,17 @@ static void check_keywords(const char *buffer){
 		uspawn_command();
 	} else if(str_eq(buffer, "fbtest")){
 		fbtest_command();
+	} else if(str_eq(buffer, "fbmirror")){
+		int m = !fb_get_mirror();
+		fb_set_mirror(m);
+		kprintf("fb mirror: %s\n", m ? "on" : "off");
+	} else if(str_eq(buffer, "home stop")){
+		home_stop();
+		kprintf("desktop stopped\n");
+	} else if(str_eq(buffer, "home")){
+		if(fb_width() == 0){ kprintf("no framebuffer\n"); }
+		else if(home_active()){ kprintf("desktop already running\n"); }
+		else { home_start(); kprintf("desktop started\n"); }
 	} else if(str_eq(buffer, "locktest")){
 		locktest_command();
 	} else if(str_eq(buffer, "semtest")){
@@ -709,6 +783,16 @@ static void check_keywords(const char *buffer){
 		cat_command(buffer + 4);
 	} else if(str_eq(buffer, "ls")){
 		ls_command();
+	} else if(str_eq(buffer, "test_uart")){
+		test_uart_command();
+	} else if(str_eq(buffer, "test_gpio")){
+		test_gpio_command();
+	} else if(str_eq(buffer, "test_timer")){
+		test_timer_command();
+	} else if(str_eq(buffer, "test_alloc")){
+		test_alloc_command();
+	} else if(str_eq(buffer, "test_all")){
+		test_all_command();
 	} else {
 		command_error();
 	}
@@ -730,8 +814,16 @@ void kernel_main(void) {
 	cpu_install_vectors();
 	uart_init();
 
-	kprintf("hello from bare metal\n");
-	kprintf("running at EL%d\n", cpu_get_el());
+	kprintf("\n");
+	kprintf("============================================\n");
+	kprintf("  %s v%s\n", HUDOS_NAME, HUDOS_VERSION);
+	kprintf("  Bare metal %s OS\n", HUDOS_ARCH);
+	kprintf("  Board: %s\n", HUDOS_BOARD);
+	kprintf("  Running at %s\n", HUDOS_EL);
+	kprintf("  Built: %s %s\n", __DATE__, __TIME__);
+	kprintf("  Author: %s\n", HUDOS_AUTHOR);
+	kprintf("============================================\n");
+	kprintf("\n");
 
 	// initialize heap (needed before MMU for page table alloc)
 	alloc_init();

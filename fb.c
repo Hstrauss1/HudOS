@@ -12,6 +12,13 @@ static unsigned int fb_size;
 static unsigned int con_cx, con_cy;     // cursor position in characters
 static unsigned int con_cols, con_rows; // text grid size
 static unsigned int con_fg, con_bg;
+static int          con_enabled = 1;    // set to 0 to suppress console output
+
+// display mirror: QEMU raspi4b renders the framebuffer horizontally flipped.
+// set fb_mirror=1 to compensate by flipping x in every pixel write.
+// initialized to 0 here; fb_init() sets it to 1 at runtime (boot.s doesn't
+// copy .data, so static initializers cannot be trusted for non-zero values).
+static int fb_mirror = 0;
 
 // 8x8 bitmap font for printable ASCII (32-126)
 // each character is 8 bytes, one per row, MSB = leftmost pixel
@@ -186,6 +193,11 @@ int fb_init(unsigned int width, unsigned int height){
 	fb_h = height;
 	fb_p = mbox_buf[33]; // pitch in bytes
 
+	// QEMU raspi4b renders the framebuffer horizontally mirrored (x=0 = right edge).
+	// Compensate by enabling mirror mode at runtime — cannot rely on static initializer
+	// because boot.s does not copy .data from ROM to RAM before calling kernel_main().
+	fb_mirror = 1;
+
 	return 0;
 }
 
@@ -193,9 +205,12 @@ unsigned int fb_width(void)  { return fb_w; }
 unsigned int fb_height(void) { return fb_h; }
 unsigned int fb_pitch(void)  { return fb_p; }
 
+void fb_set_mirror(int m){ fb_mirror = m; }
+int  fb_get_mirror(void){ return fb_mirror; }
+
 void fb_put_pixel(unsigned int x, unsigned int y, unsigned int color){
 	if(x >= fb_w || y >= fb_h) return;
-	// pitch is in bytes, each pixel is 4 bytes
+	if(fb_mirror) x = fb_w - 1 - x;
 	unsigned int offset = (y * fb_p / 4) + x;
 	fb_ptr[offset] = color;
 }
@@ -207,9 +222,11 @@ void fb_clear(unsigned int color){
 }
 
 void fb_fill_rect(unsigned int x, unsigned int y, unsigned int w, unsigned int h, unsigned int color){
+	// when mirrored, the rectangle is placed at the flipped x position
+	unsigned int px = (fb_mirror && fb_w >= x + w) ? (fb_w - x - w) : x;
 	for(unsigned int row = y; row < y + h && row < fb_h; row++){
-		unsigned int off = (row * fb_p / 4) + x;
-		for(unsigned int col = 0; col < w && x + col < fb_w; col++){
+		unsigned int off = (row * fb_p / 4) + px;
+		for(unsigned int col = 0; col < w && px + col < fb_w; col++){
 			fb_ptr[off + col] = color;
 		}
 	}
@@ -226,6 +243,29 @@ void fb_put_char(unsigned int x, unsigned int y, char c, unsigned int fg, unsign
 			unsigned int color = (bits & (0x80 >> col)) ? fg : bg;
 			fb_put_pixel(x + col, y + row, color);
 		}
+	}
+}
+
+void fb_put_char_scaled(unsigned int x, unsigned int y, char c, unsigned int scale, unsigned int fg, unsigned int bg){
+	int idx = c - 32;
+	if(idx < 0 || idx > 94) idx = 0;
+	const unsigned char *glyph = font8x8[idx];
+	for(int row = 0; row < 8; row++){
+		unsigned char bits = glyph[row];
+		for(int col = 0; col < 8; col++){
+			unsigned int color = (bits & (0x80 >> col)) ? fg : bg;
+			for(unsigned int dy = 0; dy < scale; dy++)
+				for(unsigned int dx = 0; dx < scale; dx++)
+					fb_put_pixel(x + col * scale + dx, y + row * scale + dy, color);
+		}
+	}
+}
+
+void fb_put_string_scaled(unsigned int x, unsigned int y, const char *s, unsigned int scale, unsigned int fg, unsigned int bg){
+	while(*s){
+		fb_put_char_scaled(x, y, *s, scale, fg, bg);
+		x += 8 * scale;
+		s++;
 	}
 }
 
@@ -251,7 +291,11 @@ void fb_console_init(unsigned int fg, unsigned int bg){
 	con_cy = 0;
 	con_cols = fb_w / 8;
 	con_rows = fb_h / 8;
+	con_enabled = 1;
 }
+
+void fb_console_enable(void)  { con_enabled = 1; }
+void fb_console_disable(void) { con_enabled = 0; }
 
 static void console_scroll(void){
 	// move all rows up by one character row (8 pixels)
@@ -268,7 +312,7 @@ static void console_scroll(void){
 }
 
 void fb_console_putc(char c){
-	if(!fb_ptr) return;
+	if(!fb_ptr || !con_enabled) return;
 
 	if(c == '\n' || c == '\r'){
 		con_cx = 0;

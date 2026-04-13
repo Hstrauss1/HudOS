@@ -4,10 +4,10 @@
 #include "timer.h"
 #include "sched.h"
 #include "task.h"
+#include "vfs.h"
 
 unsigned long syscall_handler(unsigned long num, unsigned long arg0, unsigned long arg1, unsigned long arg2){
 	(void)arg1;
-	(void)arg2;
 
 	switch(num){
 		case SYS_PUTC:
@@ -27,6 +27,17 @@ unsigned long syscall_handler(unsigned long num, unsigned long arg0, unsigned lo
 		case SYS_SLEEP:
 			task_sleep_ms(arg0);
 			return 0;
+		case SYS_OPEN:
+			return (unsigned long)vfs_open((const char *)arg0, (int)arg1);
+		case SYS_CLOSE:
+			vfs_close((int)arg0);
+			return 0;
+		case SYS_READ:
+			return (unsigned long)vfs_read((int)arg0, (void *)arg1, (int)arg2);
+		case SYS_WRITE:
+			return (unsigned long)vfs_write((int)arg0, (const void *)arg1, (int)arg2);
+		case SYS_SEEK:
+			return (unsigned long)vfs_seek((int)arg0, (int)arg1, (int)arg2);
 		default:
 			uart_puts("[syscall] unknown: ");
 			uart_puthex(num);

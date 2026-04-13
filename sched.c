@@ -39,6 +39,21 @@ void schedule(void){
 	current_task = next;
 
 	cpu_switch_to(&tasks[prev].context, &tasks[next].context);
+	// After a context switch, reload TTBR0_EL1 for EL1 tasks so the
+	// correct per-process page table is active before we eret back to EL1.
+	{
+		unsigned long ttbr = tasks[current_task].ttbr0_el1;
+		if(ttbr){
+			__asm__ volatile(
+				"msr TTBR0_EL1, %0\n"
+				"isb\n"
+				"tlbi vmalle1\n"
+				"dsb sy\n"
+				"isb"
+				:: "r"(ttbr)
+			);
+		}
+	}
 }
 
 void yield(void){

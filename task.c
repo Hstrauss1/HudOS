@@ -3,6 +3,7 @@
 #include "alloc.h"
 #include "string.h"
 #include "timer.h"
+#include "proc.h"
 
 task_t tasks[MAX_TASKS];
 int current_task = 0;
@@ -29,6 +30,11 @@ int task_create_named(void (*entry)(void), const char *name){
 	int id = -1;
 	for(int i = 1; i < MAX_TASKS; i++){
 		if(tasks[i].state == TASK_UNUSED || tasks[i].state == TASK_DEAD){
+			// Free EL2 stack from a dead slot so it isn't leaked.
+			if(tasks[i].state == TASK_DEAD && tasks[i].stack){
+				kfree(tasks[i].stack);
+				tasks[i].stack = 0;
+			}
 			id = i;
 			break;
 		}
@@ -41,6 +47,9 @@ int task_create_named(void (*entry)(void), const char *name){
 	t->id = id;
 	t->state = TASK_READY;
 	t->wake_time = 0;
+	t->ttbr0_el1 = 0;
+	t->el1_stack  = 0;
+	t->proc       = 0;
 
 	// copy name
 	int k = 0;
@@ -87,6 +96,9 @@ static void task_cleanup(task_t *t){
 		kfree(t->stack);
 		t->stack = 0;
 	}
+	if(t->el1_stack){ kfree(t->el1_stack); t->el1_stack = 0; }
+	if(t->proc)     { proc_free(t->proc);  t->proc = 0;       }
+	t->ttbr0_el1 = 0;
 }
 
 void task_exit(void){

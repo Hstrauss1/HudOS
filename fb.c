@@ -9,10 +9,11 @@ static unsigned int fb_w, fb_h, fb_p; // width, height, pitch (bytes per row)
 static unsigned int fb_size;
 
 // console state
-static unsigned int con_cx, con_cy;     // cursor position in characters
-static unsigned int con_cols, con_rows; // text grid size
+static unsigned int con_cx, con_cy;           // cursor position in characters
+static unsigned int con_cols, con_rows;       // text grid size (characters)
+static unsigned int con_x0, con_y0;          // top-left pixel origin of console region
 static unsigned int con_fg, con_bg;
-static int          con_enabled = 1;    // set to 0 to suppress console output
+static int          con_enabled = 1;          // set to 0 to suppress console output
 
 // display mirror: QEMU raspi4b renders the framebuffer horizontally flipped.
 // set fb_mirror=1 to compensate by flipping x in every pixel write.
@@ -196,7 +197,7 @@ int fb_init(unsigned int width, unsigned int height){
 	// QEMU raspi4b renders the framebuffer horizontally mirrored (x=0 = right edge).
 	// Compensate by enabling mirror mode at runtime — cannot rely on static initializer
 	// because boot.s does not copy .data from ROM to RAM before calling kernel_main().
-	fb_mirror = 1;
+	fb_mirror = 0;
 
 	return 0;
 }
@@ -240,7 +241,7 @@ void fb_put_char(unsigned int x, unsigned int y, char c, unsigned int fg, unsign
 	for(int row = 0; row < 8; row++){
 		unsigned char bits = glyph[row];
 		for(int col = 0; col < 8; col++){
-			unsigned int color = (bits & (0x80 >> col)) ? fg : bg;
+			unsigned int color = (bits & (0x01 << col)) ? fg : bg;
 			fb_put_pixel(x + col, y + row, color);
 		}
 	}
@@ -253,7 +254,7 @@ void fb_put_char_scaled(unsigned int x, unsigned int y, char c, unsigned int sca
 	for(int row = 0; row < 8; row++){
 		unsigned char bits = glyph[row];
 		for(int col = 0; col < 8; col++){
-			unsigned int color = (bits & (0x80 >> col)) ? fg : bg;
+			unsigned int color = (bits & (0x01 << col)) ? fg : bg;
 			for(unsigned int dy = 0; dy < scale; dy++)
 				for(unsigned int dx = 0; dx < scale; dx++)
 					fb_put_pixel(x + col * scale + dx, y + row * scale + dy, color);
@@ -284,75 +285,85 @@ void fb_put_string(unsigned int x, unsigned int y, const char *s, unsigned int f
 
 // --- console with scrolling ---
 
-void fb_console_init(unsigned int fg, unsigned int bg){
-	con_fg = fg;
-	con_bg = bg;
-	con_cx = 0;
-	con_cy = 0;
-	con_cols = fb_w / 8;
-	con_rows = fb_h / 8;
+// initialize console to a sub-region of the framebuffer
+void fb_console_init_region(unsigned int x, unsigned int y,
+                             unsigned int cols, unsigned int rows,
+                             unsigned int fg, unsigned int bg){
+	con_fg   = fg;
+	con_bg   = bg;
+	con_x0   = x;
+	con_y0   = y;
+	con_cols = cols;
+	con_rows = rows;
+	con_cx   = 0;
+	con_cy   = 0;
 	con_enabled = 1;
+	fb_fill_rect(x, y, cols * 8, rows * 8, bg);
+}
+
+// initialize console spanning the full framebuffer
+void fb_console_init(unsigned int fg, unsigned int bg){
+	fb_console_init_region(0, 0, fb_w / 8, fb_h / 8, fg, bg);
 }
 
 void fb_console_enable(void)  { con_enabled = 1; }
 void fb_console_disable(void) { con_enabled = 0; }
 
 static void console_scroll(void){
-	// move all rows up by one character row (8 pixels)
-	unsigned int row_pixels = 8;
-	unsigned int *dst = (unsigned int *)fb_ptr;
-	unsigned int *src = (unsigned int *)fb_ptr + (row_pixels * fb_p / 4);
-	unsigned int count = (fb_h - row_pixels) * fb_p / 4;
-	for(unsigned int i = 0; i < count; i++)
-		dst[i] = src[i];
+	// scroll the console region up by one character row (8 pixels)
+	unsigned int pw = con_cols * 8; // pixel width of console region
+	for(unsigned int r = 0; r < (con_rows - 1) * 8; r++){
+		unsigned int *dst = (unsigned int *)fb_ptr + ((con_y0 + r)     * fb_p / 4) + con_x0;
+		unsigned int *src = (unsigned int *)fb_ptr + ((con_y0 + r + 8) * fb_p / 4) + con_x0;
+		for(unsigned int c = 0; c < pw; c++) dst[c] = src[c];
+	}
+	// clear the newly revealed bottom row
+	fb_fill_rect(con_x0, con_y0 + (con_rows - 1) * 8, pw, 8, con_bg);
+}
 
-	// clear the last row
-	unsigned int last_y = (con_rows - 1) * 8;
-	fb_fill_rect(0, last_y, fb_w, 8, con_bg);
+// erase cursor block at current position
+static void con_erase_cursor(void){
+	fb_fill_rect(con_x0 + con_cx * 8, con_y0 + con_cy * 8, 2, 8, con_bg);
+}
+
+// draw cursor block at current position
+static void con_draw_cursor(void){
+	fb_fill_rect(con_x0 + con_cx * 8, con_y0 + con_cy * 8, 2, 8, con_fg);
+}
+
+static void con_newline(void){
+	con_cx = 0;
+	con_cy++;
+	if(con_cy >= con_rows){
+		console_scroll();
+		con_cy = con_rows - 1;
+	}
 }
 
 void fb_console_putc(char c){
 	if(!fb_ptr || !con_enabled) return;
 
-	if(c == '\n' || c == '\r'){
-		con_cx = 0;
-		con_cy++;
-		if(con_cy >= con_rows){
-			console_scroll();
-			con_cy = con_rows - 1;
-		}
-		return;
-	}
-	if(c == '\b'){
+	con_erase_cursor();
+
+	if(c == '\n'){
+		con_newline();
+	} else if(c == '\r'){
+		con_cx = 0;               // carriage return only — don't advance row
+	} else if(c == '\b' || c == 127){
 		if(con_cx > 0){
 			con_cx--;
-			fb_put_char(con_cx * 8, con_cy * 8, ' ', con_fg, con_bg);
+			fb_put_char(con_x0 + con_cx * 8, con_y0 + con_cy * 8, ' ', con_fg, con_bg);
 		}
-		return;
-	}
-	if(c == '\t'){
+	} else if(c == '\t'){
 		con_cx = (con_cx + 4) & ~3;
-		if(con_cx >= con_cols){
-			con_cx = 0;
-			con_cy++;
-			if(con_cy >= con_rows){
-				console_scroll();
-				con_cy = con_rows - 1;
-			}
-		}
-		return;
+		if(con_cx >= con_cols) con_newline();
+	} else if(c >= 32 && c < 127){
+		fb_put_char(con_x0 + con_cx * 8, con_y0 + con_cy * 8, c, con_fg, con_bg);
+		con_cx++;
+		if(con_cx >= con_cols) con_newline();
 	}
 
-	fb_put_char(con_cx * 8, con_cy * 8, c, con_fg, con_bg);
-	con_cx++;
-	if(con_cx >= con_cols){
-		con_cx = 0;
-		con_cy++;
-		if(con_cy >= con_rows){
-			console_scroll();
-			con_cy = con_rows - 1;
-		}
-	}
+	con_draw_cursor();
 }
 
 void fb_console_puts(const char *s){
@@ -361,7 +372,7 @@ void fb_console_puts(const char *s){
 }
 
 void fb_console_clear(void){
-	fb_clear(con_bg);
+	fb_fill_rect(con_x0, con_y0, con_cols * 8, con_rows * 8, con_bg);
 	con_cx = 0;
 	con_cy = 0;
 }

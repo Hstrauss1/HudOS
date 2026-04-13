@@ -10,6 +10,14 @@ static volatile char uart_rx_buf[UART_BUF_SIZE];
 static volatile int uart_rx_head = 0;
 static volatile int uart_rx_tail = 0;
 
+// optional hook: called from uart_putc for every output character
+// use this to mirror all kernel output to a second destination (e.g. fb_console)
+static void (*uart_output_hook)(char c) = 0;
+
+void uart_set_output_hook(void (*fn)(char c)){
+	uart_output_hook = fn;
+}
+
 void uart_init(void) {
 	UART0_CR = 0x0;
 	UART0_ICR = 0x7FF;
@@ -21,9 +29,9 @@ void uart_init(void) {
 }
 
 void uart_putc(char c) {
-	while (UART0_FR & (1 << 5)) { // Fifo in FULL (4 is in)
-	}
+	while (UART0_FR & (1 << 5)) {}
 	UART0_DR = (unsigned int)c;
+	if(uart_output_hook) uart_output_hook(c);
 }
 
 void uart_puts(const char *s) {

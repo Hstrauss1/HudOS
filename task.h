@@ -2,6 +2,8 @@
 #ifndef TASK_H
 #define TASK_H
 
+#include "proc.h"
+
 #define MAX_TASKS       16
 #define TASK_STACK_SIZE 4096
 
@@ -38,6 +40,9 @@ typedef struct {
 	unsigned long wake_time;  // system timer ticks to wake at (if sleeping)
 	cpu_context_t context;
 	unsigned char *stack;
+	unsigned long  ttbr0_el1;   // non-0 → EL1 task; loaded to TTBR0_EL1 on switch
+	unsigned char *el1_stack;   // EL1 user stack allocation (freed on task exit)
+	proc_t        *proc;        // EL1 page table (freed on task exit)
 } task_t;
 
 void task_init(void);

@@ -11,6 +11,9 @@ void uart_puthex(unsigned long val);
 // formatted output (supports %d %u %x %s %c %p %%)
 void kprintf(const char *fmt, ...);
 
+// output hook: fn(c) is called after every uart_putc (e.g. to mirror to fb_console)
+void uart_set_output_hook(void (*fn)(char c));
+
 // UART RX interrupt support
 void uart_irq_enable(void);
 void uart_irq_handler(void);

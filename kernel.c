@@ -12,7 +12,7 @@
 #include "mmu.h"
 #include "task.h"
 #include "sched.h"
-#include "ramfs.h"
+#include "vfs.h"
 #include "spinlock.h"
 #include "semaphore.h"
 #include "fb.h"
@@ -24,12 +24,38 @@
 #include "version.h"
 #include "test.h"
 #include "home.h"
+#include "elf.h"
+#include "sd.h"
+#include "fat32.h"
+#include "kb.h"
 
 // skip past the current argument to the next space-separated one
 static const char *next_arg(const char *s){
 	while(*s && *s != ' ') ++s;
 	while(*s == ' ') ++s;
 	return s;
+}
+
+// ── shell working directory ───────────────────────────────────────────────────
+
+static char cwd[128] = "/";
+
+// build an absolute path from a user-supplied name (relative or absolute)
+// result written into out[outlen]
+static void build_path(char *out, int outlen, const char *name){
+	if(name[0] == '/'){
+		int i = 0;
+		while(name[i] && i < outlen - 1){ out[i] = name[i]; i++; }
+		out[i] = '\0';
+	} else {
+		int i = 0;
+		while(cwd[i] && i < outlen - 1){ out[i] = cwd[i]; i++; }
+		// add separator only when cwd is not "/"
+		if(i > 0 && out[i-1] != '/' && i < outlen - 1) out[i++] = '/';
+		int j = 0;
+		while(name[j] && i < outlen - 1){ out[i++] = name[j++]; }
+		out[i] = '\0';
+	}
 }
 
 // --- commands ---
@@ -74,10 +100,23 @@ static void help_command(){
 	uart_puts("  mqtest              message queue ping-pong demo\n");
 	uart_puts("  mutextest           mutex shared counter demo\n");
 	uart_puts("\n[filesystem]\n");
-	uart_puts("  mkfile <name>       create a ramfs file\n");
+	uart_puts("  ls [path]           list directory contents\n");
+	uart_puts("  mkdir <name>        create directory\n");
+	uart_puts("  mkfile <name>       create empty file\n");
 	uart_puts("  write <name> <data> write data to file\n");
 	uart_puts("  cat <name>          read file contents\n");
-	uart_puts("  ls                  list ramfs files\n");
+	uart_puts("  rm <name>           remove file or empty directory\n");
+	uart_puts("  cd <path>           change working directory\n");
+	uart_puts("  pwd                 print working directory\n");
+	uart_puts("  exec <path>         load ELF binary from VFS and run it\n");
+	uart_puts("\n[keyboard]\n");
+	uart_puts("  kbinit              init USB HID keyboard (DWC2 OTG)\n");
+	uart_puts("\n[sd card / fat32]\n");
+	uart_puts("  sdinit              initialize SD card\n");
+	uart_puts("  sdls [path]         list directory on SD card (FAT32)\n");
+	uart_puts("  sdcat <path>        print file from SD card\n");
+	uart_puts("  sdexec <path>       load and run ELF from SD card\n");
+	uart_puts("  mount               copy /bin/* from SD into VFS /bin\n");
 	uart_puts("\n[framebuffer]\n");
 	uart_puts("  fbtest              draw test pattern on framebuffer\n");
 	uart_puts("  fbmirror            toggle horizontal mirror (QEMU fix)\n");
@@ -570,47 +609,112 @@ static void uspawn_command(){
 	kprintf("spawned user task %d\n", id);
 }
 
-// --- ramfs commands ---
+// --- filesystem commands ---
+
+static void pwd_command(void){
+	uart_puts(cwd);
+	uart_puts("\n");
+}
+
+static void cd_command(const char *arg){
+	char path[128];
+	build_path(path, 128, arg);
+	int inode = vfs_resolve(path);
+	if(inode < 0 || vfs_inode_type(inode) != VFS_DIR){
+		uart_puts("no such directory: ");
+		uart_puts(arg);
+		uart_puts("\n");
+		return;
+	}
+	int i = 0;
+	while(path[i] && i < 127){ cwd[i] = path[i]; i++; }
+	cwd[i] = '\0';
+}
+
+static void ls_command(const char *arg){
+	char path[128];
+	if(arg && arg[0])
+		build_path(path, 128, arg);
+	else {
+		int i = 0;
+		while(cwd[i] && i < 127){ path[i] = cwd[i]; i++; }
+		path[i] = '\0';
+	}
+	int dir = vfs_resolve(path);
+	if(dir < 0 || vfs_inode_type(dir) != VFS_DIR){
+		uart_puts("no such directory: ");
+		uart_puts(path);
+		uart_puts("\n");
+		return;
+	}
+	int found = 0;
+	char buf[20];
+	for(int i = 0; i < vfs_max_inodes(); i++){
+		if(!vfs_inode_used(i) || vfs_inode_parent(i) != dir) continue;
+		found++;
+		int t = vfs_inode_type(i);
+		uart_puts(t == VFS_DIR ? "  d  " : "  f  ");
+		uart_puts(vfs_inode_name(i));
+		if(t == VFS_FILE){
+			uart_puts("  ");
+			itoa(vfs_inode_size(i), buf, 20);
+			uart_puts(buf);
+			uart_puts("B");
+		}
+		uart_puts("\n");
+	}
+	if(!found) uart_puts("(empty)\n");
+}
+
+static void mkdir_command(const char *arg){
+	char path[128];
+	build_path(path, 128, arg);
+	if(vfs_mkdir(path) < 0){
+		uart_puts("mkdir failed: ");
+		uart_puts(arg);
+		uart_puts("\n");
+	} else {
+		uart_puts("created dir '");
+		uart_puts(arg);
+		uart_puts("'\n");
+	}
+}
 
 static void mkfile_command(const char *arg){
-	int fd = ramfs_create(arg);
+	char path[128];
+	build_path(path, 128, arg);
+	int fd = vfs_open(path, O_WRONLY | O_CREAT);
 	if(fd < 0){
 		uart_puts("failed to create file\n");
 		return;
 	}
-	char buf[12];
-	itoa(fd, buf, 12);
-	uart_puts("created file '");
+	vfs_close(fd);
+	uart_puts("created '");
 	uart_puts(arg);
-	uart_puts("' fd=");
-	uart_puts(buf);
-	uart_puts("\n");
+	uart_puts("'\n");
 }
 
 // write <name> <data>
 static void write_command(const char *arg){
-	// find the space between name and data
 	const char *name_start = arg;
 	const char *data = next_arg(arg);
-	// extract name
 	char name[32];
 	int i = 0;
-	while(name_start < data - 1 && i < 31){
-		if(*name_start == ' ') break;
-		name[i++] = *name_start++;
+	while(name_start[i] && name_start[i] != ' ' && i < 31){
+		name[i] = name_start[i]; i++;
 	}
 	name[i] = '\0';
 
-	int fd = ramfs_find(name);
+	char path[128];
+	build_path(path, 128, name);
+	int fd = vfs_open(path, O_WRONLY | O_CREAT | O_TRUNC);
 	if(fd < 0){
-		fd = ramfs_create(name);
-		if(fd < 0){
-			uart_puts("failed to create file\n");
-			return;
-		}
+		uart_puts("failed to open/create file\n");
+		return;
 	}
 	int len = k_strlen(data);
-	ramfs_write(fd, data, len);
+	vfs_write(fd, data, len);
+	vfs_close(fd);
 	char buf[12];
 	itoa(len, buf, 12);
 	uart_puts("wrote ");
@@ -621,37 +725,220 @@ static void write_command(const char *arg){
 }
 
 static void cat_command(const char *arg){
-	int fd = ramfs_find(arg);
+	char path[128];
+	build_path(path, 128, arg);
+	int fd = vfs_open(path, O_RDONLY);
 	if(fd < 0){
 		uart_puts("file not found: ");
 		uart_puts(arg);
 		uart_puts("\n");
 		return;
 	}
-	char buf[RAMFS_MAX_SIZE + 1];
-	int len = ramfs_read(fd, buf, RAMFS_MAX_SIZE);
+	char buf[VFS_MAX_FSIZE + 1];
+	int len = vfs_read(fd, buf, VFS_MAX_FSIZE);
+	vfs_close(fd);
+	if(len < 0) len = 0;
 	buf[len] = '\0';
 	uart_puts(buf);
+	if(len > 0 && buf[len-1] != '\n') uart_puts("\n");
+}
+
+static void rm_command(const char *arg){
+	char path[128];
+	build_path(path, 128, arg);
+	if(vfs_unlink(path) < 0){
+		uart_puts("rm failed (not found or dir not empty): ");
+		uart_puts(arg);
+		uart_puts("\n");
+	} else {
+		uart_puts("removed '");
+		uart_puts(arg);
+		uart_puts("'\n");
+	}
+}
+
+// exec <vfs-path>  — load ELF64 binary from VFS and run it as a user task
+static void exec_command(const char *arg){
+	char path[128];
+	build_path(path, 128, arg);
+
+	// derive a short task name from the filename
+	const char *name = arg;
+	for(const char *p = arg; *p; p++)
+		if(*p == '/') name = p + 1;
+
+	int tid = elf_exec(path, name);
+	if(tid < 0){
+		uart_puts("exec failed\n");
+	} else {
+		char buf[12];
+		itoa(tid, buf, 12);
+		uart_puts("exec: task ");
+		uart_puts(buf);
+		uart_puts(" started\n");
+	}
+}
+
+// --- SD card / FAT32 commands ---
+
+static void sdinit_command(void){
+	if(sd_init() == 0){
+		uart_puts("SD card initialized\n");
+		if(fat32_mount() == 0)
+			uart_puts("FAT32 partition mounted\n");
+		else
+			uart_puts("FAT32 mount failed (no FAT32 partition?)\n");
+	} else {
+		uart_puts("SD init failed\n");
+	}
+}
+
+// callback used by sdls
+static void sdls_cb(const char *name, int is_dir, unsigned int size){
+	uart_puts(is_dir ? "  d  " : "  f  ");
+	uart_puts(name);
+	if(!is_dir){
+		uart_puts("  ");
+		char buf[16];
+		itoa((int)size, buf, 16);
+		uart_puts(buf);
+		uart_puts("B");
+	}
 	uart_puts("\n");
 }
 
-static void ls_command(){
-	int count = ramfs_count();
-	if(count == 0){
-		uart_puts("(no files)\n");
+static void sdls_command(const char *arg){
+	if(!fat32_mounted()){
+		uart_puts("SD not mounted — run sdinit first\n");
 		return;
 	}
-	char buf[20];
-	for(int i = 0; i < RAMFS_MAX_FILES; i++){
-		const char *name = ramfs_name(i);
-		if(name[0] == '\0') continue;
-		uart_puts("  ");
-		uart_puts(name);
-		uart_puts("  ");
-		itoa(ramfs_size(i), buf, 20);
-		uart_puts(buf);
-		uart_puts(" bytes\n");
+	const char *path = (arg && arg[0]) ? arg : "/";
+	uart_puts("SD:");
+	uart_puts(path);
+	uart_puts("\n");
+	if(fat32_readdir(path, sdls_cb) < 0)
+		uart_puts("(not found or not a directory)\n");
+}
+
+// Max size we'll try to load from SD for cat/exec
+#define SD_MAX_LOAD (256 * 1024u)
+
+static void sdcat_command(const char *arg){
+	if(!arg || !arg[0]){ uart_puts("usage: sdcat <path>\n"); return; }
+	if(!fat32_mounted()){ uart_puts("SD not mounted\n"); return; }
+
+	unsigned char *buf = (unsigned char *)kmalloc(SD_MAX_LOAD);
+	if(!buf){ uart_puts("out of memory\n"); return; }
+
+	int n = fat32_load(arg, buf, SD_MAX_LOAD);
+	if(n < 0){
+		uart_puts("not found: ");
+		uart_puts(arg);
+		uart_puts("\n");
+	} else {
+		buf[n] = '\0';
+		uart_puts((char *)buf);
+		if(n > 0 && buf[n-1] != '\n') uart_puts("\n");
 	}
+	kfree(buf);
+}
+
+static void sdexec_command(const char *arg){
+	if(!arg || !arg[0]){ uart_puts("usage: sdexec <path>\n"); return; }
+	if(!fat32_mounted()){ uart_puts("SD not mounted\n"); return; }
+
+	unsigned char *buf = (unsigned char *)kmalloc(SD_MAX_LOAD);
+	if(!buf){ uart_puts("out of memory\n"); return; }
+
+	int n = fat32_load(arg, buf, SD_MAX_LOAD);
+	if(n < 0){
+		uart_puts("not found: ");
+		uart_puts(arg);
+		uart_puts("\n");
+		kfree(buf);
+		return;
+	}
+
+	// derive short task name from filename
+	const char *name = arg;
+	for(const char *p = arg; *p; p++)
+		if(*p == '/') name = p + 1;
+
+	int tid = elf_exec_buf(buf, (unsigned int)n, name);
+	kfree(buf);
+	if(tid < 0){
+		uart_puts("exec failed\n");
+	} else {
+		char tmp[12];
+		itoa(tid, tmp, 12);
+		uart_puts("exec: task ");
+		uart_puts(tmp);
+		uart_puts(" started\n");
+	}
+}
+
+// mount: copy every regular file under SD "/" into VFS "/bin"
+// collect_cb and mount_command share static arrays (mount is synchronous).
+#define MOUNT_MAX_FILES 32
+static char mount_names[MOUNT_MAX_FILES][13];
+static int  mount_is_dir[MOUNT_MAX_FILES];
+static int  mount_count;
+
+static void mount_collect_cb(const char *name, int is_dir, unsigned int sz){
+	(void)sz;
+	if(mount_count >= MOUNT_MAX_FILES) return;
+	int j = 0;
+	while(name[j] && j < 12){ mount_names[mount_count][j] = name[j]; j++; }
+	mount_names[mount_count][j] = '\0';
+	mount_is_dir[mount_count] = is_dir;
+	mount_count++;
+}
+
+static unsigned char mount_buf[SD_MAX_LOAD];
+
+static void mount_command(void){
+	if(!fat32_mounted()){ uart_puts("SD not mounted — run sdinit first\n"); return; }
+
+	mount_count = 0;
+	fat32_readdir("/", mount_collect_cb);
+
+	int copied = 0;
+	for(int i = 0; i < mount_count; i++){
+		if(mount_is_dir[i]) continue;
+
+		// build SD path
+		char sdpath[16];
+		sdpath[0] = '/';
+		int j = 0;
+		while(mount_names[i][j] && j < 13){ sdpath[j+1] = mount_names[i][j]; j++; }
+		sdpath[j+1] = '\0';
+
+		int n = fat32_load(sdpath, mount_buf, SD_MAX_LOAD);
+		if(n < 0) continue;
+
+		// write into VFS /bin/<name>
+		char vpath[32];
+		vpath[0]='/'; vpath[1]='b'; vpath[2]='i'; vpath[3]='n'; vpath[4]='/';
+		j = 0;
+		while(mount_names[i][j] && j < 12){ vpath[5+j] = mount_names[i][j]; j++; }
+		vpath[5+j] = '\0';
+
+		int fd = vfs_open(vpath, O_WRONLY | O_CREAT | O_TRUNC);
+		if(fd < 0){ uart_puts("vfs open failed: "); uart_puts(vpath); uart_puts("\n"); continue; }
+		vfs_write(fd, mount_buf, n);
+		vfs_close(fd);
+
+		uart_puts("  mounted ");
+		uart_puts(vpath);
+		uart_puts("\n");
+		copied++;
+	}
+
+	char buf[12];
+	itoa(copied, buf, 12);
+	uart_puts("mount: ");
+	uart_puts(buf);
+	uart_puts(" file(s) copied to /bin\n");
 }
 
 // --- self-test commands ---
@@ -775,14 +1062,44 @@ static void check_keywords(const char *buffer){
 		mqtest_command();
 	} else if(str_eq(buffer, "mutextest")){
 		mutextest_command();
+	} else if(str_eq(buffer, "pwd")){
+		pwd_command();
+	} else if(str_starts_with(buffer, "cd ")){
+		cd_command(buffer + 3);
+	} else if(str_starts_with(buffer, "ls ")){
+		ls_command(buffer + 3);
+	} else if(str_eq(buffer, "ls")){
+		ls_command("");
+	} else if(str_starts_with(buffer, "mkdir ")){
+		mkdir_command(buffer + 6);
 	} else if(str_starts_with(buffer, "mkfile ")){
 		mkfile_command(buffer + 7);
 	} else if(str_starts_with(buffer, "write ")){
 		write_command(buffer + 6);
 	} else if(str_starts_with(buffer, "cat ")){
 		cat_command(buffer + 4);
-	} else if(str_eq(buffer, "ls")){
-		ls_command();
+	} else if(str_starts_with(buffer, "rm ")){
+		rm_command(buffer + 3);
+	} else if(str_starts_with(buffer, "exec ")){
+		exec_command(buffer + 5);
+	} else if(str_eq(buffer, "kbinit")){
+		uart_puts("initializing USB keyboard...\n");
+		if(kb_init() == 0)
+			uart_puts("keyboard ready\n");
+		else
+			uart_puts("keyboard init failed (no USB keyboard?)\n");
+	} else if(str_eq(buffer, "sdinit")){
+		sdinit_command();
+	} else if(str_starts_with(buffer, "sdls ")){
+		sdls_command(buffer + 5);
+	} else if(str_eq(buffer, "sdls")){
+		sdls_command("/");
+	} else if(str_starts_with(buffer, "sdcat ")){
+		sdcat_command(buffer + 6);
+	} else if(str_starts_with(buffer, "sdexec ")){
+		sdexec_command(buffer + 7);
+	} else if(str_eq(buffer, "mount")){
+		mount_command();
 	} else if(str_eq(buffer, "test_uart")){
 		test_uart_command();
 	} else if(str_eq(buffer, "test_gpio")){
@@ -798,10 +1115,40 @@ static void check_keywords(const char *buffer){
 	}
 }
 
+// Read one character from either the USB keyboard or the UART IRQ ring buffer.
+// Blocks until a character is available; polls keyboard every ~1ms.
+static char shell_getc(void){
+	while(1){
+		// poll USB keyboard for new HID reports (~1ms cadence)
+		kb_poll();
+		if(kb_ready()) return kb_getc();
+		// check UART IRQ ring buffer
+		int c = uart_irq_getc();
+		if(c >= 0) return (char)c;
+		delay_us(1000);
+	}
+}
+
 static void query_terminal(char *terminalBuffer, int maxLen){
 	while(1){
 		uart_puts(">");
-		uart_gets(terminalBuffer, maxLen);
+		// Read a line from either USB keyboard or UART
+		int i = 0;
+		while(i < maxLen - 1){
+			char c = shell_getc();
+			if(c == '\r' || c == '\n') break;
+			if(c == '\b' || c == 0x7f){  // backspace / delete
+				if(i > 0){
+					uart_putc('\b'); uart_putc(' '); uart_putc('\b');
+					i--;
+				}
+				continue;
+			}
+			if(c < 32 || c > 126) continue; // ignore non-printable
+			terminalBuffer[i++] = c;
+			uart_putc(c);    // echo
+		}
+		terminalBuffer[i] = '\0';
 		uart_puts("\n");
 		check_keywords(terminalBuffer);
 	}
@@ -856,9 +1203,14 @@ void kernel_main(void) {
 	task_init();
 	kprintf("scheduler initialized\n");
 
-	// initialize ram filesystem
-	ramfs_init();
-	kprintf("ramfs initialized\n");
+	// initialize virtual filesystem and standard directory tree
+	vfs_init();
+	vfs_mkdir("/bin");     // executables
+	vfs_mkdir("/etc");     // config files
+	vfs_mkdir("/home");    // user home
+	vfs_mkdir("/var");
+	vfs_mkdir("/var/log"); // logs
+	kprintf("vfs initialized\n");
 
 	query_terminal(terminal_Buffer, terminal_Len);
 

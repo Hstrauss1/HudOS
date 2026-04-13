@@ -28,6 +28,9 @@ void fb_put_string_scaled(unsigned int x, unsigned int y, const char *s, unsigne
 
 // console: auto-advancing text cursor with scrolling
 void fb_console_init(unsigned int fg, unsigned int bg);
+void fb_console_init_region(unsigned int x, unsigned int y,
+                             unsigned int cols, unsigned int rows,
+                             unsigned int fg, unsigned int bg);
 void fb_console_putc(char c);
 void fb_console_puts(const char *s);
 void fb_console_clear(void);

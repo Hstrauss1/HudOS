@@ -2,6 +2,7 @@
 #include "cpu.h"
 #include "uart.h"
 #include "task.h"
+#include "proc.h"
 
 // defined in vectors.S
 extern void exception_vector_table(void);
@@ -166,6 +167,45 @@ void exception_handler(int type, unsigned long *regs){
 		case 0x38: kprintf("BKPT (AArch32)\n"); break;
 		case 0x3C: kprintf("BRK (AArch64)\n"); break;
 		default:   kprintf("Other (0x%x)\n", ec); break;
+	}
+
+	// ── recoverable fault from an EL1 user process ────────────────────────────
+	// EC 0x20 = instruction abort from lower EL
+	// EC 0x24 = data abort from lower EL
+	// If the faulting task has a proc (is an isolated EL1 task) and the fault
+	// is a translation fault, kill the task gracefully instead of halting.
+	if((ec == 0x20 || ec == 0x24) && current_task > 0
+	   && tasks[current_task].proc != 0){
+		int fsc = (int)(esr & 0x3Fu);
+		int is_translation = (fsc & 0x3Cu) == 0x04;  // DFSC/IFSC[5:2] = 0001
+
+		if(is_translation){
+			kprintf("\n[SIGSEGV] task %d (%s): %s fault at 0x%x  pc=0x%x\n",
+				current_task,
+				tasks[current_task].name,
+				(ec == 0x24) ? "data" : "insn",
+				far, elr);
+			kprintf("[SIGSEGV] killing task and rescheduling\n");
+
+			// Mark dead; free EL1 resources now.
+			// The EL2 stack (tasks[i].stack) is NOT freed here because we are
+			// still running on it — it will be freed when the slot is reused.
+			tasks[current_task].state = TASK_DEAD;
+			if(tasks[current_task].el1_stack){
+				kfree(tasks[current_task].el1_stack);
+				tasks[current_task].el1_stack = 0;
+			}
+			if(tasks[current_task].proc){
+				proc_free((proc_t*)tasks[current_task].proc);
+				tasks[current_task].proc = 0;
+			}
+			tasks[current_task].ttbr0_el1 = 0;
+
+			// Switch to another task (we are at EL2 here, so this is safe).
+			extern void schedule(void);
+			schedule();
+			// If we return (no other runnable task), fall through to halt.
+		}
 	}
 
 	// extra decoding for data aborts

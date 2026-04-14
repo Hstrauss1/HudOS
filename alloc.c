@@ -61,7 +61,8 @@ void *kmalloc_aligned(unsigned long size, unsigned long align){
 	free_block_t **prev = &free_list;
 	free_block_t *blk = free_list;
 	while(blk){
-		if(blk->size >= total){
+		unsigned long user_addr = (unsigned long)blk + HEADER_SIZE;
+		if(blk->size >= total && (align == 16 || (user_addr & (align - 1)) == 0)){
 			// found a fit — remove from free list
 			*prev = blk->next;
 			free_block_count--;

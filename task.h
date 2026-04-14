@@ -13,6 +13,7 @@
 #define TASK_RUNNING    2
 #define TASK_DEAD       3
 #define TASK_SLEEPING   4
+#define TASK_BLOCKED    5
 
 #define TASK_NAME_LEN   16
 

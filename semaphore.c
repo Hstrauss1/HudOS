@@ -33,23 +33,24 @@ static int waitq_pop(semaphore_t *s){
 }
 
 void sem_wait(semaphore_t *s){
-	unsigned long flags = spin_lock_irqsave(&s->lock);
+	while(1){
+		unsigned long flags = spin_lock_irqsave(&s->lock);
 
-	if(s->count > 0){
-		s->count--;
+		if(s->count > 0){
+			s->count--;
+			spin_unlock_irqrestore(&s->lock, flags);
+			return;
+		}
+
+		int me = current_task;
+		if(waitq_push(s, me) == 0){
+			tasks[me].state = TASK_BLOCKED;
+			tasks[me].wake_time = 0;
+		}
+
 		spin_unlock_irqrestore(&s->lock, flags);
-		return;
+		schedule();
 	}
-
-	// block: put current task on the wait queue and mark sleeping
-	int me = current_task;
-	waitq_push(s, me);
-	tasks[me].state = TASK_SLEEPING;
-	// wake_time = 0 means "woken by semaphore, not timer"
-	tasks[me].wake_time = 0;
-
-	spin_unlock_irqrestore(&s->lock, flags);
-	schedule();
 }
 
 void sem_signal(semaphore_t *s){
@@ -57,7 +58,8 @@ void sem_signal(semaphore_t *s){
 
 	int id = waitq_pop(s);
 	if(id >= 0){
-		// wake a blocked task
+		// hand one permit to a blocked task, which will consume it on wake
+		s->count++;
 		tasks[id].state = TASK_READY;
 	} else {
 		// no waiters, increment count

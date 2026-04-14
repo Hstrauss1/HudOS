@@ -13,10 +13,12 @@ void kprintf(const char *fmt, ...);
 
 // output hook: fn(c) is called after every uart_putc (e.g. to mirror to fb_console)
 void uart_set_output_hook(void (*fn)(char c));
+void (*uart_get_output_hook(void))(char c);
 
 // UART RX interrupt support
 void uart_irq_enable(void);
 void uart_irq_handler(void);
 int uart_irq_getc(void);  // returns -1 if no char available
+int uart_poll_getc(void); // returns -1 if no char available
 
 #endif

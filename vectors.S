@@ -67,7 +67,11 @@ VECTOR_ENTRY curr_el_sp0_sync
     mov x0, #0
     mov x1, sp
     bl  exception_handler
+    cbnz w0, 1f
     b   halt
+1:
+    RESTORE_CONTEXT
+    eret
 
 VECTOR_ENTRY curr_el_sp0_irq
     SAVE_CONTEXT
@@ -80,7 +84,11 @@ VECTOR_ENTRY curr_el_sp0_fiq
     mov x0, #2
     mov x1, sp
     bl  exception_handler
+    cbnz w0, 1f
     b   halt
+1:
+    RESTORE_CONTEXT
+    eret
 
 VECTOR_ENTRY curr_el_sp0_serror
     SAVE_CONTEXT
@@ -95,7 +103,11 @@ VECTOR_ENTRY curr_el_spx_sync
     mov x0, #0
     mov x1, sp
     bl  exception_handler
+    cbnz w0, 1f
     b   halt
+1:
+    RESTORE_CONTEXT
+    eret
 
 VECTOR_ENTRY curr_el_spx_irq
     SAVE_CONTEXT
@@ -108,7 +120,11 @@ VECTOR_ENTRY curr_el_spx_fiq
     mov x0, #2
     mov x1, sp
     bl  exception_handler
+    cbnz w0, 1f
     b   halt
+1:
+    RESTORE_CONTEXT
+    eret
 
 VECTOR_ENTRY curr_el_spx_serror
     SAVE_CONTEXT
@@ -117,15 +133,18 @@ VECTOR_ENTRY curr_el_spx_serror
     bl  exception_handler
     b   halt
 
-// --- lower EL using AArch64 (SVC lands here) ---
+// --- lower EL using AArch64 (HVC/SVC from EL1 land here) ---
 VECTOR_ENTRY lower_el_a64_sync
     SAVE_CONTEXT
-    // check if this is an SVC (ESR EC = 0x15)
+    // check if this is an HVC/SVC (ESR EC = 0x16 / 0x15)
     mrs x3, ESR_EL2
     lsr x4, x3, #26
     cmp x4, #0x15
+    b.eq lower_sync_syscall
+    cmp x4, #0x16
     b.ne lower_sync_not_svc
-    // SVC: x8 = syscall number, x0-x2 = args (saved on stack)
+lower_sync_syscall:
+    // syscall trap: x8 = syscall number, x0-x2 = args (saved on stack)
     ldp x0, x1, [sp, #0]       // original x0, x1
     ldr x2, [sp, #16]          // original x2
     ldr x3, [sp, #64]          // original x8 = syscall num
@@ -145,7 +164,11 @@ lower_sync_not_svc:
     mov x0, #0
     mov x1, sp
     bl  exception_handler
+    cbnz w0, 1f
     b   halt
+1:
+    RESTORE_CONTEXT
+    eret
 
 VECTOR_ENTRY lower_el_a64_irq
     SAVE_CONTEXT
@@ -158,7 +181,11 @@ VECTOR_ENTRY lower_el_a64_fiq
     mov x0, #2
     mov x1, sp
     bl  exception_handler
+    cbnz w0, 1f
     b   halt
+1:
+    RESTORE_CONTEXT
+    eret
 
 VECTOR_ENTRY lower_el_a64_serror
     SAVE_CONTEXT
@@ -173,7 +200,11 @@ VECTOR_ENTRY lower_el_a32_sync
     mov x0, #0
     mov x1, sp
     bl  exception_handler
+    cbnz w0, 1f
     b   halt
+1:
+    RESTORE_CONTEXT
+    eret
 
 VECTOR_ENTRY lower_el_a32_irq
     SAVE_CONTEXT
@@ -186,7 +217,11 @@ VECTOR_ENTRY lower_el_a32_fiq
     mov x0, #2
     mov x1, sp
     bl  exception_handler
+    cbnz w0, 1f
     b   halt
+1:
+    RESTORE_CONTEXT
+    eret
 
 VECTOR_ENTRY lower_el_a32_serror
     SAVE_CONTEXT

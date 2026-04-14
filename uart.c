@@ -1,6 +1,7 @@
 //Hudson Strauss
 #include "mmio.h"
 #include "uart.h"
+#include "platform.h"
 
 #define del uart_putc('\b');
 
@@ -18,12 +19,21 @@ void uart_set_output_hook(void (*fn)(char c)){
 	uart_output_hook = fn;
 }
 
+void (*uart_get_output_hook(void))(char c){
+	return uart_output_hook;
+}
+
 void uart_init(void) {
+#if defined(PLATFORM_VIRT)
+	UART0_ICR = 0x7FF;
+	UART0_CR = (1 << 0) | (1 << 8) | (1 << 9);
+	return;
+#endif
 	UART0_CR = 0x0;
 	UART0_ICR = 0x7FF;
 
-	UART0_IBRD = 26;
-	UART0_FBRD = 3;
+	UART0_IBRD = PLATFORM_UART_IBRD;
+	UART0_FBRD = PLATFORM_UART_FBRD;
 	UART0_LCRH = (1 << 4) | (1 << 5) | (1 << 6);
 	UART0_CR = (1 << 0) | (1 << 8) | (1 << 9);
 }
@@ -208,4 +218,11 @@ int uart_irq_getc(void){
 	char c = uart_rx_buf[uart_rx_tail];
 	uart_rx_tail = (uart_rx_tail + 1) % UART_BUF_SIZE;
 	return c;
+}
+
+// polled receive path for environments where UART RX interrupts are unreliable
+int uart_poll_getc(void){
+	if(UART0_FR & (1 << 4))
+		return -1;
+	return (int)(UART0_DR & 0xFF);
 }

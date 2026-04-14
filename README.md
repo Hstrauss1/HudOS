@@ -194,17 +194,59 @@ context (x0–x30, ELR, ESR, FAR) and calls `exception_handler()`, which prints:
 make
 ```
 
+### Real Tiny C
+
+Use the repo-level `tcc` wrapper for the real Tiny C compiler:
+
+```sh
+./tcc tiny_c_compiler/samples/hello.c -o build/hello.elf
+```
+
+This runs the host-side compiler in [tiny_c_compiler/](/Users/hudsons/Code/rPiOS/tiny_c_compiler).
+
+To boot HudOS with a Tiny C app embedded:
+
+```sh
+make PLATFORM=virt TINY_APP=tiny_c_compiler/samples/hello.c run
+```
+
+Inside HudOS, the old in-kernel subset compiler is `toycc`, not `tcc`.
+
 ### Run in QEMU (with display)
 
 ```sh
 make run
 ```
 
+`make run` attaches serial input/output to the launching terminal, which is the
+currently reliable input path in QEMU.
+The QEMU keyboard is attached directly to the DWC2 root port (`usb-bus.0,port=1`)
+to avoid QEMU auto-inserting a USB hub in front of it.
+
+### Experimental QEMU serial-console window
+
+```sh
+make run-vc
+```
+
+This uses QEMU's own serial console window (`-serial vc`). Depending on the
+host/QEMU build, keyboard input there may be inconsistent.
+
 ### Run headless (serial only)
 
 ```sh
 make run-serial
 ```
+
+### Run the `virt` platform skeleton
+
+```sh
+make run-virt
+```
+
+This boots a serial-only `virt` target with Pi-specific peripherals disabled.
+It is the starting point for bringing up simpler QEMU-native input devices
+without depending on the Raspberry Pi 4 USB host path.
 
 ### GDB debug session
 
@@ -295,6 +337,8 @@ Type `help` at the `>` prompt for the full grouped list. Quick reference:
 | `write <name> <data>` | Write text data to file |
 | `cat <name>` | Print file contents |
 | `ls` | List all files with sizes |
+| `tcc <src> -o <out>` | Real host-side Tiny C compiler in the repo |
+| `toycc <src> -o <out>` | In-kernel toy Tiny C subset compiler |
 
 ### Framebuffer
 

@@ -6,6 +6,8 @@
 unsigned long timer_get_ticks(void);
 void delay_us(unsigned long us);
 void delay_ms(unsigned long ms);
+unsigned long timer_clock_hz(void);
+unsigned long timer_ms_to_ticks(unsigned long ms);
 
 // ARM generic timer IRQ support (hypervisor physical timer at EL2)
 void timer_init(unsigned int interval_ms);

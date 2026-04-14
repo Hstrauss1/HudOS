@@ -3,6 +3,8 @@
 #include "uart.h"
 #include "task.h"
 #include "proc.h"
+#include "alloc.h"
+#include "syscall.h"
 
 // defined in vectors.S
 extern void exception_vector_table(void);
@@ -121,7 +123,7 @@ static void dump_stack(unsigned long fp, unsigned long sp){
 //   [248]     = ELR_EL2
 //   [256]     = ESR_EL2
 //   [264]     = FAR_EL2
-void exception_handler(int type, unsigned long *regs){
+int exception_handler(int type, unsigned long *regs){
 	static const char *type_names[] = {"SYNC", "IRQ", "FIQ", "SError"};
 
 	cpu_disable_irqs();
@@ -134,6 +136,14 @@ void exception_handler(int type, unsigned long *regs){
 	unsigned long esr = regs[256 / 8];
 	unsigned long far = regs[264 / 8];
 	int ec = (esr >> 26) & 0x3F;
+
+	if(ec == 0x16 && current_task > 0 && tasks[current_task].el1_stack){
+		unsigned long num = regs[8];
+		unsigned long ret = syscall_handler(num, regs[0], regs[1], regs[2]);
+		regs[0] = ret;
+		regs[248 / 8] = elr + 4;
+		return 1;
+	}
 
 	kprintf("  ELR: %x  (faulting instruction)\n", elr);
 	kprintf("  ESR: %x\n", esr);
@@ -240,6 +250,7 @@ void exception_handler(int type, unsigned long *regs){
 	kprintf("\n============================================\n");
 	kprintf("SYSTEM HALTED\n");
 	kprintf("============================================\n");
+	return 0;
 }
 
 void cpu_enable_irqs(void){

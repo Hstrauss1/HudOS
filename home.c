@@ -161,6 +161,10 @@ static void home_task_fn(void){
 void home_start(void){
     if(home_running) return;
     if(fb_width() == 0) return;
+    if(home_task_id >= 0){
+        task_kill(home_task_id);
+        home_task_id = -1;
+    }
     home_running = 1;
 
     unsigned int W  = fb_width();
@@ -198,6 +202,8 @@ void home_start(void){
 
 void home_stop(void){
     home_running = 0;
+    if(home_task_id >= 0)
+        task_kill(home_task_id);
     home_task_id = -1;
     uart_set_output_hook(0);
     fb_console_disable();

@@ -94,6 +94,15 @@ static int wait_status(unsigned int mask, unsigned int timeout_ms){
     return 0;
 }
 
+static int wait_control1_clear(unsigned int mask, unsigned int timeout_ms){
+    unsigned int us = timeout_ms * 1000;
+    for(unsigned int t = 0; t < us; t += 10){
+        if(!(EMMC_CONTROL1 & mask)) return 1;
+        delay_us(10);
+    }
+    return 0;
+}
+
 // send one command; returns RESP0 or -1 on error
 static int send_cmd(unsigned int cmd, unsigned int arg){
     unsigned int inhibit = SR_CMD_INHIBIT;
@@ -126,7 +135,7 @@ int sd_init(void){
     // ── 1. reset controller ───────────────────────────────────────────────────
     EMMC_CONTROL0 = 0;
     EMMC_CONTROL1 = C1_SRST_HC;
-    if(!wait_status(C1_SRST_HC, 100)){
+    if(!wait_control1_clear(C1_SRST_HC, 100)){
         uart_puts("[sd] controller reset timeout\n"); return -1;
     }
 

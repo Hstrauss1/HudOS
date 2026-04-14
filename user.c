@@ -4,6 +4,8 @@
 #include "alloc.h"
 #include "string.h"
 #include "proc.h"
+#include "platform.h"
+#include "uart.h"
 
 // per-task EL1 entry context, indexed by task ID
 // set before the task is scheduled — no race possible
@@ -17,6 +19,8 @@ static void user_task_wrapper(void){
     task_t *t = task_current();
     void (*fn)(void)  = user_ctxs[t->id].fn;
     unsigned long sp  = user_ctxs[t->id].sp;
+    if(!PLATFORM_INIT_MMU)
+        uart_puts("[user] entering EL1 task\n");
     user_enter_el1(fn, sp);
 }
 
@@ -28,13 +32,26 @@ int user_task_create(void (*fn)(void), const char *name){
     int id = task_create_named(user_task_wrapper, name);
     if(id < 0){ kfree(el1_stack); return -1; }
 
+    extern task_t tasks[];
+
+    // On early non-Pi bring-up targets we keep EL1 in a simple identity-mapped
+    // mode without a per-process MMU. That is enough to run freestanding user
+    // binaries and syscalls while the platform port is still taking shape.
+    if(!PLATFORM_INIT_MMU){
+        user_ctxs[id].fn = fn;
+        user_ctxs[id].sp = el1_sp;
+        tasks[id].el1_stack = el1_stack;
+        tasks[id].proc = 0;
+        tasks[id].ttbr0_el1 = 0;
+        return id;
+    }
+
     // Build a full identity-map page table for this process.
     proc_t *pt = proc_create();
     if(!pt){ kfree(el1_stack); task_kill(id); return -1; }
 
     // Isolate other EL1 tasks: remove their EL1 stacks from this new table,
     // and remove this task's stack from their tables.
-    extern task_t tasks[];
     extern int    num_tasks;
     for(int i = 0; i < num_tasks; i++){
         if(tasks[i].el1_stack && i != id){

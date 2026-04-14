@@ -5,6 +5,8 @@
 #include "string.h"
 #include "user.h"
 #include "uart.h"
+#include "task.h"
+#include "platform.h"
 
 // ── ELF64 structures ──────────────────────────────────────────────────────────
 
@@ -14,6 +16,14 @@
 #define ET_EXEC      2              // executable
 #define EM_AARCH64   0x00B7        // AArch64 machine type
 #define PT_LOAD      1              // loadable segment
+
+#if defined(PLATFORM_VIRT)
+#define USER_LOAD_BASE  0x40200000UL
+#define USER_LOAD_LIMIT 0x41000000UL
+#else
+#define USER_LOAD_BASE  0x02000000UL
+#define USER_LOAD_LIMIT 0x04000000UL
+#endif
 
 typedef struct {
     unsigned int   e_magic;         // 0x7F 'E' 'L' 'F'
@@ -48,6 +58,15 @@ typedef struct {
     unsigned long  p_align;
 } __attribute__((packed)) elf64_phdr_t;
 
+static int range_fits(unsigned long start, unsigned long len, unsigned long limit){
+    return start <= limit && len <= limit - start;
+}
+
+static int user_load_range_ok(unsigned long start, unsigned long len){
+    return start >= USER_LOAD_BASE &&
+           range_fits(start, len, USER_LOAD_LIMIT);
+}
+
 // ── shared loader core ────────────────────────────────────────────────────────
 
 // Validate, load PT_LOAD segments, and spawn a user task from an ELF64 buffer.
@@ -75,21 +94,54 @@ static int elf_load_buf(const unsigned char *buf, unsigned int size,
         return -1;
     }
 
+    if(hdr->e_phoff > (unsigned long)size ||
+       hdr->e_phnum > ((unsigned long)size - hdr->e_phoff) / hdr->e_phentsize){
+        uart_puts("[elf] program header table extends past end of file\n");
+        return -1;
+    }
+
+    int saw_load = 0;
+    int entry_in_load = 0;
+
     for(int i = 0; i < hdr->e_phnum; i++){
         unsigned long phoff = hdr->e_phoff + (unsigned long)i * hdr->e_phentsize;
-        if(phoff + sizeof(elf64_phdr_t) > (unsigned long)size) break;
 
         const elf64_phdr_t *ph = (const elf64_phdr_t *)(buf + phoff);
         if(ph->p_type != PT_LOAD) continue;
         if(ph->p_memsz == 0) continue;
 
+        saw_load = 1;
+
+        if(ph->p_filesz > ph->p_memsz){
+            uart_puts("[elf] PT_LOAD filesz exceeds memsz\n");
+            return -1;
+        }
+
+        if(!user_load_range_ok(ph->p_vaddr, ph->p_memsz)){
+            uart_puts("[elf] PT_LOAD lies outside user window\n");
+            return -1;
+        }
+
+        if(hdr->e_entry >= ph->p_vaddr &&
+           hdr->e_entry - ph->p_vaddr < ph->p_memsz)
+            entry_in_load = 1;
+
         void *dst = (void *)ph->p_vaddr;
 
         unsigned long copy = ph->p_filesz;
+        if(ph->p_offset >= (unsigned long)size){
+            uart_puts("[elf] segment lies beyond end of file\n");
+            return -1;
+        }
         if(ph->p_offset + copy > (unsigned long)size)
             copy = (unsigned long)size - ph->p_offset;
         if(copy > 0)
             memcpy(dst, buf + ph->p_offset, copy);
+
+        if(copy != ph->p_filesz){
+            uart_puts("[elf] truncated PT_LOAD segment\n");
+            return -1;
+        }
 
         if(ph->p_memsz > ph->p_filesz)
             memset((unsigned char *)dst + ph->p_filesz, 0,
@@ -101,9 +153,17 @@ static int elf_load_buf(const unsigned char *buf, unsigned int size,
         uart_puts("[elf] zero entry point\n");
         return -1;
     }
+    if(!saw_load || !user_load_range_ok(entry, 1) || !entry_in_load){
+        uart_puts("[elf] entry lies outside loadable user image\n");
+        return -1;
+    }
 
     void (*fn)(void) = (void (*)(void))entry;
-    int tid = user_task_create(fn, task_name);
+    int tid;
+    if(!PLATFORM_INIT_MMU)
+        tid = task_create_named(fn, task_name);
+    else
+        tid = user_task_create(fn, task_name);
     if(tid < 0){
         uart_puts("[elf] failed to create task\n");
         return -1;

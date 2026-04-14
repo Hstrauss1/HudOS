@@ -45,6 +45,8 @@
 #define HPRT_OVRCURRCHNG (1u<<5)    // w1c
 #define HPRT_RST        (1u << 8)
 #define HPRT_PWR        (1u << 12)
+#define HPRT_SPD_SHIFT  17
+#define HPRT_SPD_MASK   (3u << HPRT_SPD_SHIFT)
 // mask of w1c bits — never write these 1 unless intentionally clearing them
 #define HPRT_W1C_MASK   (HPRT_CONNDET | HPRT_ENCHNG | HPRT_OVRCURRCHNG | (1u<<6))
 
@@ -58,6 +60,7 @@
 // [30]    CHDIS    disable channel
 // [31]    CHENA    enable channel
 #define HCCHAR_IN       (1u << 15)
+#define HCCHAR_LSDEV    (1u << 17)
 #define HCCHAR_CTL      (0u << 18)
 #define HCCHAR_INTR     (3u << 18)
 #define HCCHAR_ODDFRM   (1u << 29)
@@ -76,6 +79,10 @@
 #define HCINT_NAK       (1u << 4)
 #define HCINT_XACTERR   (1u << 7)
 #define HCINT_BBLERR    (1u << 8)
+#define HCINT_ACK       (1u << 5)
+
+#define HCINT_COMMON_MASK (HCINT_XFERCOMPL | HCINT_CHHLTD | HCINT_STALL | \
+                           HCINT_NAK | HCINT_XACTERR | HCINT_BBLERR | HCINT_ACK)
 
 // ── GINTSTS bits ─────────────────────────────────────────────────────────────
 #define GINTSTS_RXFLVL  (1u << 4)   // RX FIFO non-empty
@@ -85,6 +92,43 @@ static int kb_addr   = 0;   // assigned USB device address (0 = not ready)
 static int kb_ep     = 1;   // interrupt IN endpoint number
 static int kb_mps    = 8;   // interrupt endpoint max packet size
 static int kb_toggle = 0;   // data toggle for interrupt IN (0=DATA0, 1=DATA1)
+static int kb_low_speed = 0;
+static unsigned int kb_last_out_intr = 0;
+static unsigned int kb_last_in_intr  = 0;
+static unsigned int kb_last_in_ci    = 0;
+static unsigned int kb_last_grx      = 0;
+static int kb_last_in_received       = 0;
+
+static void usb_dump_status(const char *tag){
+    uart_puts("[kb] ");
+    uart_puts(tag);
+    uart_puts(": out_intr=");
+    uart_puthex(kb_last_out_intr);
+    uart_puts(" in_intr=");
+    uart_puthex(kb_last_in_intr);
+    uart_puts(" in_ci=");
+    uart_puthex(kb_last_in_ci);
+    uart_puts(" grx=");
+    uart_puthex(kb_last_grx);
+    uart_puts(" recv=");
+    uart_puthex((unsigned long)kb_last_in_received);
+    uart_puts(" hprt=");
+    uart_puthex(HPRT);
+    uart_puts(" hcchar0=");
+    uart_puthex(HCCHAR(0));
+    uart_puts(" hctsiz0=");
+    uart_puthex(HCTSIZ(0));
+    uart_puts("\n");
+}
+
+static const char *port_speed_name(unsigned int spd){
+    switch(spd){
+        case 0: return "high";
+        case 1: return "full";
+        case 2: return "low";
+        default: return "unknown";
+    }
+}
 
 // ASCII ring buffer
 #define KB_BUF  32
@@ -200,22 +244,27 @@ static unsigned int ch_wait(int ch){
 static int usb_out(int ch, int addr, int ep, unsigned int ep_type, int mps,
                    unsigned int pid, const unsigned char *data, int len){
     HCINT(ch)  = 0xFFFFFFFF;
+    HCINTMSK(ch) = HCINT_COMMON_MASK;
     HCSPLT(ch) = 0;
+    kb_last_out_intr = 0;
 
     int pkts = len ? (len + mps - 1) / mps : 1;
     HCTSIZ(ch) = ((unsigned)len & 0x7FFFFu) |
                  ((unsigned)(pkts & 0x3FF) << 19) | pid;
 
-    HCCHAR(ch) = ((unsigned)(mps & 0x7FF)) |
-                 ((unsigned)(ep & 0xF) << 11) |
-                 /* OUT: EPDir bit = 0 */
-                 ep_type |
-                 ((unsigned)(addr & 0x7F) << 22) |
-                 HCCHAR_CHENA;
+    unsigned int hcchar = ((unsigned)(mps & 0x7FF)) |
+                          ((unsigned)(ep & 0xF) << 11) |
+                          /* OUT: EPDir bit = 0 */
+                          ep_type |
+                          ((unsigned)(addr & 0x7F) << 22);
+    if(kb_low_speed) hcchar |= HCCHAR_LSDEV;
 
     if(len > 0) fifo_tx(ch, data, len);
 
+    HCCHAR(ch) = hcchar | HCCHAR_CHENA;
+
     unsigned int intr = ch_wait(ch);
+    kb_last_out_intr = intr;
     HCINT(ch) = 0xFFFFFFFF;
     return (intr & HCINT_XFERCOMPL) ? 0 : -1;
 }
@@ -225,7 +274,12 @@ static int usb_out(int ch, int addr, int ep, unsigned int ep_type, int mps,
 static int usb_in(int ch, int addr, int ep, unsigned int ep_type, int mps,
                   unsigned int pid, unsigned char *buf, int len){
     HCINT(ch)  = 0xFFFFFFFF;
+    HCINTMSK(ch) = HCINT_COMMON_MASK;
     HCSPLT(ch) = 0;
+    kb_last_in_intr = 0;
+    kb_last_in_ci = 0;
+    kb_last_grx = 0;
+    kb_last_in_received = 0;
 
     int pkts = len ? (len + mps - 1) / mps : 1;
 
@@ -233,6 +287,7 @@ static int usb_in(int ch, int addr, int ep, unsigned int ep_type, int mps,
                           ((unsigned)(ep & 0xF) << 11) |
                           HCCHAR_IN | ep_type |
                           ((unsigned)(addr & 0x7F) << 22);
+    if(kb_low_speed) hcchar |= HCCHAR_LSDEV;
 
     // For interrupt endpoints set ODDFRM for correct microframe scheduling
     if(ep_type == HCCHAR_INTR && (HFNUM & 1)) hcchar |= HCCHAR_ODDFRM;
@@ -246,6 +301,7 @@ static int usb_in(int ch, int addr, int ep, unsigned int ep_type, int mps,
     for(int t = 0; t < 500000; t++){
         if(GINTSTS & GINTSTS_RXFLVL){
             unsigned int grx    = GRXSTSP;
+            kb_last_grx = grx;
             int          grx_ch  = (int)(grx & 0xF);
             int          grx_cnt = (int)((grx >> 4) & 0x7FF);
             int          grx_sts = (int)((grx >> 17) & 0xF);
@@ -260,10 +316,12 @@ static int usb_in(int ch, int addr, int ep, unsigned int ep_type, int mps,
                 if(grx_cnt <= want){
                     fifo_rx(buf + received, grx_cnt);
                     received += grx_cnt;
+                    kb_last_in_received = received;
                 } else {
                     fifo_rx(buf + received, want);
                     fifo_drain(grx_cnt - want);
                     received += want;
+                    kb_last_in_received = received;
                 }
             } else if(grx_sts == 3){           // IN transfer complete
                 break;
@@ -276,6 +334,7 @@ static int usb_in(int ch, int addr, int ep, unsigned int ep_type, int mps,
         // check channel interrupt flags
         unsigned int ci = HCINT(ch);
         if(ci){
+            kb_last_in_ci = ci;
             HCINT(ch) = 0xFFFFFFFF;
             if(ci & HCINT_NAK)       return -2;
             if(ci & HCINT_XFERCOMPL) return received;
@@ -286,6 +345,7 @@ static int usb_in(int ch, int addr, int ep, unsigned int ep_type, int mps,
     }
 
     unsigned int intr = ch_wait(ch);
+    kb_last_in_intr = intr;
     HCINT(ch) = 0xFFFFFFFF;
     if(intr & (HCINT_XFERCOMPL | HCINT_CHHLTD)) return received;
     return -1;
@@ -297,15 +357,21 @@ static int usb_in(int ch, int addr, int ep, unsigned int ep_type, int mps,
 static int ctrl_in(int addr, const unsigned char *setup,
                    unsigned char *buf, int len){
     int mps = (addr == 0) ? 8 : 64;
-    if(usb_out(0, addr, 0, HCCHAR_CTL, mps, PID_SETUP, setup, 8) < 0)
+    if(usb_out(0, addr, 0, HCCHAR_CTL, mps, PID_SETUP, setup, 8) < 0){
+        usb_dump_status("ctrl_in setup failed");
         return -1;
+    }
     int n = 0;
     if(len > 0){
         n = usb_in(0, addr, 0, HCCHAR_CTL, mps, PID_DATA1, buf, len);
-        if(n < 0) return -1;
+        if(n < 0){
+            usb_dump_status("ctrl_in data failed");
+            return -1;
+        }
     }
     // STATUS: ZLP OUT
-    usb_out(0, addr, 0, HCCHAR_CTL, mps, PID_DATA1, 0, 0);
+    if(usb_out(0, addr, 0, HCCHAR_CTL, mps, PID_DATA1, 0, 0) < 0)
+        usb_dump_status("ctrl_in status failed");
     return n;
 }
 
@@ -313,11 +379,14 @@ static int ctrl_in(int addr, const unsigned char *setup,
 // SETUP OUT → STATUS IN ZLP
 static int ctrl_out(int addr, const unsigned char *setup){
     int mps = (addr == 0) ? 8 : 64;
-    if(usb_out(0, addr, 0, HCCHAR_CTL, mps, PID_SETUP, setup, 8) < 0)
+    if(usb_out(0, addr, 0, HCCHAR_CTL, mps, PID_SETUP, setup, 8) < 0){
+        usb_dump_status("ctrl_out setup failed");
         return -1;
+    }
     // STATUS: ZLP IN
     unsigned char dummy[8];
-    usb_in(0, addr, 0, HCCHAR_CTL, mps, PID_DATA1, dummy, 0);
+    if(usb_in(0, addr, 0, HCCHAR_CTL, mps, PID_DATA1, dummy, 0) < 0)
+        usb_dump_status("ctrl_out status failed");
     return 0;
 }
 
@@ -330,7 +399,12 @@ static int enumerate_keyboard(void){
     // GET_DESCRIPTOR(Device, 18 bytes) — verify device exists, get ep0 MPS
     setup[0]=0x80; setup[1]=0x06; setup[2]=0x00; setup[3]=0x01;
     setup[4]=0x00; setup[5]=0x00; setup[6]=18;   setup[7]=0x00;
-    int n = ctrl_in(0, setup, buf, 18);
+    int n = -1;
+    for(int attempt = 0; attempt < 8; attempt++){
+        n = ctrl_in(0, setup, buf, 18);
+        if(n >= 8) break;
+        delay_us(10000);
+    }
     if(n < 8){
         uart_puts("[kb] GET_DESCRIPTOR(Device) failed\n");
         return -1;
@@ -439,8 +513,15 @@ static int dwc2_init(void){
     GRXFSIZ   = 0x0100u;
     GNPTXFSIZ = (0x0100u << 16) | 0x0100u;
 
-    // Host config: FS/LS support, 48 MHz PHY clock
-    HCFG = (HCFG & ~3u) | 1u;  // FSLSPclkSel = 01 (48 MHz)
+    // BCM2711/QEMU uses the high-speed PHY path, so both high-speed and
+    // full-speed devices use the 30/60 MHz setting here. Only low-speed
+    // devices need the 6 MHz clock.
+    HCFG = (HCFG & ~3u) | 0u;  // FSLSPClkSel = 00 (30/60 MHz)
+
+    // Re-enable the core after setup. We still poll status registers instead of
+    // taking IRQs, but some host-state transitions do not progress cleanly with
+    // the global interrupt gate left disabled.
+    GAHBCFG |= 1u;
 
     return 0;
 }
@@ -471,15 +552,29 @@ static int port_init(void){
     HPRT = (HPRT & ~HPRT_W1C_MASK) | HPRT_RST;
     delay_us(50000);
     HPRT = HPRT & ~(HPRT_W1C_MASK | HPRT_RST);
-    delay_us(10000);  // recovery time after reset
+    delay_us(100000);  // allow full-speed devices extra time to settle after reset
 
     // Wait for port to become enabled
     for(int t = 0; t < 200; t++){
         if(HPRT & HPRT_ENA) break;
         delay_us(1000);
     }
+    if(!(HPRT & HPRT_ENA)){
+        uart_puts("[kb] root port failed to enable: HPRT=");
+        uart_puthex(HPRT);
+        uart_puts("\n");
+        return -1;
+    }
     // Clear enable-changed bit
     HPRT = (HPRT & ~HPRT_W1C_MASK) | HPRT_ENCHNG;
+
+    unsigned int spd = (HPRT & HPRT_SPD_MASK) >> HPRT_SPD_SHIFT;
+    kb_low_speed = (spd == 2u);
+    // High-speed PHY: 30/60 MHz for high/full-speed, 6 MHz for low-speed.
+    HCFG = (HCFG & ~3u) | (kb_low_speed ? 2u : 0u);
+    uart_puts("[kb] root port speed: ");
+    uart_puts(port_speed_name(spd));
+    uart_puts("\n");
 
     return 0;
 }
@@ -491,6 +586,7 @@ int kb_init(void){
     kb_addr = kb_ep = kb_toggle = 0;
     kb_mps  = 8;
     kb_head = kb_tail = 0;
+    kb_low_speed = 0;
 
     usb_power_on();   // best-effort; QEMU may not require it
     delay_us(10000);

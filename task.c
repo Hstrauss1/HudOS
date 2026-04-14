@@ -4,6 +4,7 @@
 #include "string.h"
 #include "timer.h"
 #include "proc.h"
+#include "tinycc.h"
 
 task_t tasks[MAX_TASKS];
 int current_task = 0;
@@ -92,6 +93,7 @@ void task_trampoline(void){
 
 static void task_cleanup(task_t *t){
 	t->state = TASK_DEAD;
+	tinycc_task_cleanup(t->id);
 	if(t->stack){
 		kfree(t->stack);
 		t->stack = 0;
@@ -128,14 +130,16 @@ int task_kill(int id){
 void task_sleep_ms(unsigned long ms){
 	extern void schedule(void);
 	tasks[current_task].state = TASK_SLEEPING;
-	tasks[current_task].wake_time = timer_get_ticks() + (ms * 1000); // ticks are microseconds
+	tasks[current_task].wake_time = timer_get_ticks() + timer_ms_to_ticks(ms);
 	schedule();
 }
 
 void task_wake_sleepers(void){
 	unsigned long now = timer_get_ticks();
 	for(int i = 0; i < num_tasks; i++){
-		if(tasks[i].state == TASK_SLEEPING && now >= tasks[i].wake_time){
+		if(tasks[i].state == TASK_SLEEPING &&
+		   tasks[i].wake_time != 0 &&
+		   now >= tasks[i].wake_time){
 			tasks[i].state = TASK_READY;
 			tasks[i].wake_time = 0;
 		}

@@ -18,10 +18,13 @@ void mq_init(msgqueue_t *q){
 
 // --- internal wait queue helpers ---
 
-static void waitq_push(int *wq, int *head, int id){
+static int waitq_push(int *wq, int *head, int *tail, int id){
 	int next = (*head + 1) % 16;
+	if(next == *tail)
+		return -1;
 	wq[*head] = id;
 	*head = next;
+	return 0;
 }
 
 static int waitq_pop(int *wq, int *head, int *tail){
@@ -60,9 +63,10 @@ void mq_send(msgqueue_t *q, int type, const void *data, unsigned long len){
 
 		// queue full — block
 		int me = current_task;
-		waitq_push(q->send_waitq, &q->send_head, me);
-		tasks[me].state = TASK_SLEEPING;
-		tasks[me].wake_time = 0;
+		if(waitq_push(q->send_waitq, &q->send_head, &q->send_tail, me) == 0){
+			tasks[me].state = TASK_BLOCKED;
+			tasks[me].wake_time = 0;
+		}
 		spin_unlock_irqrestore(&q->lock, flags);
 		schedule();
 	}
@@ -119,9 +123,10 @@ void mq_recv(msgqueue_t *q, msg_t *msg){
 
 		// queue empty — block
 		int me = current_task;
-		waitq_push(q->recv_waitq, &q->recv_head, me);
-		tasks[me].state = TASK_SLEEPING;
-		tasks[me].wake_time = 0;
+		if(waitq_push(q->recv_waitq, &q->recv_head, &q->recv_tail, me) == 0){
+			tasks[me].state = TASK_BLOCKED;
+			tasks[me].wake_time = 0;
+		}
 		spin_unlock_irqrestore(&q->lock, flags);
 		schedule();
 	}

@@ -10,8 +10,6 @@ extern task_t tasks[MAX_TASKS];
 extern int current_task;
 extern int num_tasks;
 
-static volatile int preempt_pending = 0;
-
 void schedule(void){
 	// wake any sleeping tasks whose time has come
 	task_wake_sleepers();
@@ -60,8 +58,8 @@ void yield(void){
 	schedule();
 }
 
-// called from timer IRQ handler — just set a flag
-// actual switch happens when returning to interrupted code
+// called from timer IRQ handler while the interrupted task's full register
+// frame is already saved on its kernel stack by the vector entry path.
 void sched_tick(void){
-	preempt_pending = 1;
+	schedule();
 }

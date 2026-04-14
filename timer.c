@@ -1,14 +1,24 @@
 //Hudson Strauss
 #include "mmio.h"
 #include "timer.h"
+#include "platform.h"
 
 static unsigned long timer_interval_ticks = 0;
 static unsigned int timer_interval_ms = 0;
 static volatile unsigned long irq_count = 0;
 
+unsigned long timer_clock_hz(void){
+#if PLATFORM_USES_MMIO_TIMER
+	return 1000000UL;
+#else
+	return timer_get_freq();
+#endif
+}
+
 // --- BCM system timer (1MHz free-running, used for delay/uptime) ---
 
 unsigned long timer_get_ticks(void){
+#if PLATFORM_USES_MMIO_TIMER
 	unsigned int hi = TIMER_CHI;
 	unsigned int lo = TIMER_CLO;
 	if(TIMER_CHI != hi){
@@ -16,12 +26,25 @@ unsigned long timer_get_ticks(void){
 		lo = TIMER_CLO;
 	}
 	return ((unsigned long)hi << 32) | lo;
+#else
+	unsigned long ticks;
+	__asm__ volatile("mrs %0, CNTPCT_EL0" : "=r"(ticks));
+	return ticks;
+#endif
 }
 
 void delay_us(unsigned long us){
+#if PLATFORM_USES_MMIO_TIMER
 	unsigned long start = timer_get_ticks();
 	while(timer_get_ticks() - start < us){
 	}
+#else
+	unsigned long freq = timer_clock_hz();
+	unsigned long delta = (freq * us) / 1000000UL;
+	unsigned long start = timer_get_ticks();
+	while(timer_get_ticks() - start < delta){
+	}
+#endif
 }
 
 void delay_ms(unsigned long ms){
@@ -34,6 +57,10 @@ unsigned long timer_get_freq(void){
 	unsigned long freq;
 	__asm__ volatile("mrs %0, CNTFRQ_EL0" : "=r"(freq));
 	return freq;
+}
+
+unsigned long timer_ms_to_ticks(unsigned long ms){
+	return (timer_clock_hz() * ms) / 1000UL;
 }
 
 // initialize and arm the periodic timer

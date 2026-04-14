@@ -5,9 +5,12 @@
 #include "sched.h"
 #include "task.h"
 #include "vfs.h"
+#include "platform.h"
 
 unsigned long syscall_handler(unsigned long num, unsigned long arg0, unsigned long arg1, unsigned long arg2){
 	(void)arg1;
+	if(!PLATFORM_INIT_MMU && (num == SYS_PUTS || num == SYS_PUTC))
+		uart_puts("[syscall]\n");
 
 	switch(num){
 		case SYS_PUTC:

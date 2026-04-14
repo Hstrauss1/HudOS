@@ -28,12 +28,592 @@
 #include "sd.h"
 #include "fat32.h"
 #include "kb.h"
+#include "platform.h"
+#include "tinycc.h"
+
+extern const unsigned char embedded_user_app_data[];
+extern const unsigned int embedded_user_app_size;
+extern const char embedded_user_app_name[];
+static char shell_getc(void);
+static int shell_try_getc(void);
+static void shell_ungetc(char c);
+static void build_path(char *out, int outlen, const char *name);
+static void str_copy_limit(char *dst, const char *src, int cap);
 
 // skip past the current argument to the next space-separated one
 static const char *next_arg(const char *s){
 	while(*s && *s != ' ') ++s;
 	while(*s == ' ') ++s;
 	return s;
+}
+
+static void unsupported_command(const char *feature){
+	uart_puts(feature);
+	uart_puts(" is not available on this platform\n");
+}
+
+#define VI_MAX_TEXT VFS_MAX_FSIZE
+#define VI_SCREEN_ROWS 20
+#define VI_SCREEN_COLS 78
+#define VI_KEY_UP    1001
+#define VI_KEY_DOWN  1002
+#define VI_KEY_LEFT  1003
+#define VI_KEY_RIGHT 1004
+#define SHELL_HISTORY_MAX 16
+#define SHELL_LINE_MAX 256
+
+static char shell_history[SHELL_HISTORY_MAX][SHELL_LINE_MAX];
+static int shell_history_count = 0;
+static int shell_unget_buf = -1;
+
+typedef struct {
+	char path[128];
+	char buf[VI_MAX_TEXT + 1];
+	char screen_cache[VI_SCREEN_ROWS][VI_SCREEN_COLS + 2];
+	char status_cache[128];
+	int len;
+	int cursor;
+	int rowoff;
+	int coloff;
+	int dirty;
+	int mode_insert;
+	int quit;
+	int cache_valid;
+} vi_editor_t;
+
+static int vi_read_key(void){
+	char c = shell_getc();
+	if(c != 27)
+		return (unsigned char)c;
+
+	int c1 = shell_try_getc();
+	if(c1 < 0)
+		return 27;
+	if(c1 != '[')
+		shell_ungetc((char)c1);
+	if(c1 != '[')
+		return 27;
+
+	int c2 = shell_getc();
+	if(c2 == 'A') return VI_KEY_UP;
+	if(c2 == 'B') return VI_KEY_DOWN;
+	if(c2 == 'C') return VI_KEY_RIGHT;
+	if(c2 == 'D') return VI_KEY_LEFT;
+	return 27;
+}
+
+static void shell_store_history(const char *line){
+	if(!line || !line[0]) return;
+	if(shell_history_count > 0 &&
+	   str_eq(shell_history[(shell_history_count - 1) % SHELL_HISTORY_MAX], line))
+		return;
+	if(shell_history_count < SHELL_HISTORY_MAX){
+		str_copy_limit(shell_history[shell_history_count], line, SHELL_LINE_MAX);
+		shell_history_count++;
+		return;
+	}
+	for(int i = 1; i < SHELL_HISTORY_MAX; i++)
+		str_copy_limit(shell_history[i - 1], shell_history[i], SHELL_LINE_MAX);
+	str_copy_limit(shell_history[SHELL_HISTORY_MAX - 1], line, SHELL_LINE_MAX);
+}
+
+static void shell_replace_line(char *dst, int maxLen, const char *src, int *len_io){
+	while(*len_io > 0){
+		uart_putc('\b');
+		uart_putc(' ');
+		uart_putc('\b');
+		(*len_io)--;
+	}
+	int i = 0;
+	while(src[i] && i < maxLen - 1){
+		dst[i] = src[i];
+		uart_putc(src[i]);
+		i++;
+	}
+	dst[i] = '\0';
+	*len_io = i;
+}
+
+static void str_copy_limit(char *dst, const char *src, int cap){
+	int i = 0;
+	while(src[i] && i < cap - 1){
+		dst[i] = src[i];
+		i++;
+	}
+	dst[i] = '\0';
+}
+
+static void mem_move(char *dst, const char *src, int n){
+	if(n <= 0 || dst == src) return;
+	if(dst < src){
+		for(int i = 0; i < n; i++) dst[i] = src[i];
+	} else {
+		for(int i = n - 1; i >= 0; i--) dst[i] = src[i];
+	}
+}
+
+static int vi_line_start(const vi_editor_t *ed, int idx){
+	if(idx < 0) idx = 0;
+	if(idx > ed->len) idx = ed->len;
+	while(idx > 0 && ed->buf[idx - 1] != '\n') idx--;
+	return idx;
+}
+
+static int vi_line_end(const vi_editor_t *ed, int idx){
+	if(idx < 0) idx = 0;
+	if(idx > ed->len) idx = ed->len;
+	while(idx < ed->len && ed->buf[idx] != '\n') idx++;
+	return idx;
+}
+
+static int vi_cursor_col(const vi_editor_t *ed){
+	int start = vi_line_start(ed, ed->cursor);
+	return ed->cursor - start;
+}
+
+static int vi_cursor_row(const vi_editor_t *ed){
+	int row = 0;
+	for(int i = 0; i < ed->cursor && i < ed->len; i++)
+		if(ed->buf[i] == '\n') row++;
+	return row;
+}
+
+static void vi_set_cursor_row_col(vi_editor_t *ed, int target_row, int target_col){
+	int row = 0;
+	int pos = 0;
+	if(target_row < 0) target_row = 0;
+	if(target_col < 0) target_col = 0;
+	while(row < target_row && pos < ed->len){
+		if(ed->buf[pos++] == '\n') row++;
+	}
+	int line_end = vi_line_end(ed, pos);
+	int line_len = line_end - pos;
+	if(target_col > line_len) target_col = line_len;
+	ed->cursor = pos + target_col;
+}
+
+static void vi_insert_char(vi_editor_t *ed, char c){
+	if(ed->len >= VI_MAX_TEXT) return;
+	mem_move(ed->buf + ed->cursor + 1, ed->buf + ed->cursor, ed->len - ed->cursor);
+	ed->buf[ed->cursor] = c;
+	ed->len++;
+	ed->cursor++;
+	ed->buf[ed->len] = '\0';
+	ed->dirty = 1;
+}
+
+static void vi_delete_at(vi_editor_t *ed, int idx){
+	if(idx < 0 || idx >= ed->len) return;
+	mem_move(ed->buf + idx, ed->buf + idx + 1, ed->len - idx - 1);
+	ed->len--;
+	ed->buf[ed->len] = '\0';
+	ed->dirty = 1;
+}
+
+static void vi_backspace(vi_editor_t *ed){
+	if(ed->cursor <= 0) return;
+	vi_delete_at(ed, ed->cursor - 1);
+	ed->cursor--;
+}
+
+static void vi_delete_line(vi_editor_t *ed){
+	int start = vi_line_start(ed, ed->cursor);
+	int end = vi_line_end(ed, ed->cursor);
+	if(end < ed->len && ed->buf[end] == '\n') end++;
+	if(start == 0 && end >= ed->len){
+		ed->len = 0;
+		ed->cursor = 0;
+		ed->buf[0] = '\0';
+		ed->dirty = 1;
+		return;
+	}
+	mem_move(ed->buf + start, ed->buf + end, ed->len - end);
+	ed->len -= (end - start);
+	if(start > ed->len) start = ed->len;
+	ed->cursor = start;
+	ed->buf[ed->len] = '\0';
+	ed->dirty = 1;
+}
+
+static int vi_save(vi_editor_t *ed){
+	int fd = vfs_open(ed->path, O_WRONLY | O_CREAT | O_TRUNC);
+	if(fd < 0) return -1;
+	int wrote = vfs_write(fd, ed->buf, ed->len);
+	vfs_close(fd);
+	if(wrote != ed->len) return -1;
+	ed->dirty = 0;
+	return 0;
+}
+
+static void vi_scroll(vi_editor_t *ed){
+	int row = vi_cursor_row(ed);
+	int col = vi_cursor_col(ed);
+	if(row < ed->rowoff) ed->rowoff = row;
+	if(row >= ed->rowoff + VI_SCREEN_ROWS) ed->rowoff = row - VI_SCREEN_ROWS + 1;
+	if(col < ed->coloff) ed->coloff = col;
+	if(col >= ed->coloff + VI_SCREEN_COLS) ed->coloff = col - VI_SCREEN_COLS + 1;
+	if(ed->rowoff < 0) ed->rowoff = 0;
+	if(ed->coloff < 0) ed->coloff = 0;
+}
+
+static int str_eq_limit(const char *a, const char *b){
+	int i = 0;
+	while(a[i] || b[i]){
+		if(a[i] != b[i]) return 0;
+		i++;
+	}
+	return 1;
+}
+
+static void vi_build_status(const vi_editor_t *ed, const char *msg, char *out, int cap){
+	int i = 0;
+	const char *mode = ed->mode_insert ? "INSERT" : "NORMAL";
+	const char *dirty = ed->dirty ? " [+]" : "";
+	const char *tail = msg ? msg : "";
+	const char *parts[7] = {mode, "  ", ed->path, dirty, "  ", tail, 0};
+	for(int p = 0; parts[p]; p++){
+		const char *s = parts[p];
+		while(*s && i < cap - 1) out[i++] = *s++;
+	}
+	out[i] = '\0';
+}
+
+static void vi_build_screen_line(const vi_editor_t *ed, int *idx_io, char *out){
+	int idx = *idx_io;
+	int col = 0;
+	int line_col = 0;
+	if(idx >= ed->len){
+		out[0] = '~';
+		out[1] = '\0';
+		*idx_io = idx;
+		return;
+	}
+	while(idx < ed->len && ed->buf[idx] != '\n'){
+		if(line_col >= ed->coloff && col < VI_SCREEN_COLS){
+			char c = ed->buf[idx];
+			if(c < 32 || c > 126) c = '?';
+			out[col++] = c;
+		}
+		line_col++;
+		idx++;
+	}
+	out[col] = '\0';
+	if(idx < ed->len && ed->buf[idx] == '\n') idx++;
+	*idx_io = idx;
+}
+
+static void vi_draw_status(const vi_editor_t *ed, const char *msg){
+	uart_puts("\033[22;1H\033[7m");
+	kprintf("%s  %s%s  %s", ed->mode_insert ? "INSERT" : "NORMAL",
+		ed->path, ed->dirty ? " [+]" : "", msg ? msg : "");
+	uart_puts("\033[K\033[m");
+}
+
+static void vi_render(vi_editor_t *ed, const char *msg){
+	vi_scroll(ed);
+	uart_puts("\033[?25l");
+	int file_row = 0;
+	int idx = 0;
+	char line[VI_SCREEN_COLS + 2];
+	char status[128];
+	while(file_row < ed->rowoff && idx < ed->len){
+		if(ed->buf[idx++] == '\n') file_row++;
+	}
+	for(int screen_row = 0; screen_row < VI_SCREEN_ROWS; screen_row++){
+		vi_build_screen_line(ed, &idx, line);
+		if(!ed->cache_valid || !str_eq_limit(ed->screen_cache[screen_row], line)){
+			kprintf("\033[%d;1H", screen_row + 1);
+			uart_puts("\033[K");
+			uart_puts(line);
+			uart_puts("\033[K");
+			str_copy_limit(ed->screen_cache[screen_row], line, VI_SCREEN_COLS + 2);
+		}
+	}
+	vi_build_status(ed, msg, status, sizeof(status));
+	if(!ed->cache_valid || !str_eq_limit(ed->status_cache, status)){
+		vi_draw_status(ed, msg);
+		str_copy_limit(ed->status_cache, status, sizeof(ed->status_cache));
+	}
+	ed->cache_valid = 1;
+	int cursor_row = vi_cursor_row(ed) - ed->rowoff + 1;
+	int cursor_col = vi_cursor_col(ed) - ed->coloff + 1;
+	if(cursor_row < 1) cursor_row = 1;
+	if(cursor_row > VI_SCREEN_ROWS) cursor_row = VI_SCREEN_ROWS;
+	if(cursor_col < 1) cursor_col = 1;
+	if(cursor_col > VI_SCREEN_COLS) cursor_col = VI_SCREEN_COLS;
+	kprintf("\033[%d;%dH", cursor_row, cursor_col);
+	uart_puts("\033[?25h");
+}
+
+static void vi_command_prompt(vi_editor_t *ed){
+	char cmd[16];
+	int i = 0;
+	vi_draw_status(ed, ":");
+	kprintf("\033[22;3H");
+	while(i < (int)sizeof(cmd) - 1){
+		int c = vi_read_key();
+		if(c == '\r' || c == '\n') break;
+		if(c == 27) return;
+		if((c == '\b' || c == 0x7f) && i > 0){
+			i--;
+			uart_puts("\b \b");
+			continue;
+		}
+		if(c < 32 || c > 126) continue;
+		cmd[i++] = c;
+		uart_putc(c);
+	}
+	cmd[i] = '\0';
+	if(str_eq(cmd, "q")){
+		if(ed->dirty){
+			vi_render(ed, "No write since last change (:q! to quit)");
+			return;
+		}
+		ed->quit = 1;
+		return;
+	}
+	if(str_eq(cmd, "q!")){
+		ed->quit = 1;
+		return;
+	}
+	if(str_eq(cmd, "w")){
+		if(vi_save(ed) < 0) vi_render(ed, "write failed");
+		else vi_render(ed, "written");
+		return;
+	}
+	if(str_eq(cmd, "wq") || str_eq(cmd, "x")){
+		if(vi_save(ed) < 0){
+			vi_render(ed, "write failed");
+			return;
+		}
+		ed->quit = 1;
+		return;
+	}
+	vi_render(ed, "unknown command");
+}
+
+static void vi_move_left(vi_editor_t *ed){
+	if(ed->cursor > 0) ed->cursor--;
+}
+
+static void vi_move_right(vi_editor_t *ed){
+	if(ed->cursor < ed->len) ed->cursor++;
+}
+
+static void vi_move_down(vi_editor_t *ed){
+	int row = vi_cursor_row(ed);
+	int col = vi_cursor_col(ed);
+	vi_set_cursor_row_col(ed, row + 1, col);
+}
+
+static void vi_move_up(vi_editor_t *ed){
+	int row = vi_cursor_row(ed);
+	int col = vi_cursor_col(ed);
+	if(row > 0) vi_set_cursor_row_col(ed, row - 1, col);
+}
+
+static void vi_open_command(const char *arg){
+	if(!arg || !*arg){
+		uart_puts("usage: vi <file>\n");
+		return;
+	}
+	char path[128];
+	build_path(path, 128, arg);
+	vi_editor_t *ed = (vi_editor_t *)kmalloc(sizeof(vi_editor_t));
+	if(!ed){
+		uart_puts("vi: out of memory\n");
+		return;
+	}
+	memset(ed, 0, sizeof(*ed));
+	str_copy_limit(ed->path, path, sizeof(ed->path));
+	void (*saved_hook)(char c) = uart_get_output_hook();
+	uart_set_output_hook(0);
+
+	int fd = vfs_open(path, O_RDONLY);
+	if(fd >= 0){
+		int n = vfs_read(fd, ed->buf, VI_MAX_TEXT);
+		vfs_close(fd);
+		if(n > 0){
+			ed->len = n;
+			ed->buf[ed->len] = '\0';
+		}
+	}
+
+	uart_puts("\033[2J\033[H");
+	vi_render(ed, "i=insert  Esc=normal  :w  :q  :wq");
+	int pending_d = 0;
+	int pending_z = 0;
+	int quit_confirm = 0;
+	while(!ed->quit){
+		int c = vi_read_key();
+		if(ed->mode_insert){
+			if(c == 3 || c == 17){
+				ed->quit = 1;
+				break;
+			}
+			if(c == 27){
+				ed->mode_insert = 0;
+				vi_render(ed, 0);
+				continue;
+			}
+			if(c == VI_KEY_LEFT) vi_move_left(ed);
+			else if(c == VI_KEY_RIGHT) vi_move_right(ed);
+			else if(c == VI_KEY_UP) vi_move_up(ed);
+			else if(c == VI_KEY_DOWN) vi_move_down(ed);
+			if(c == '\r' || c == '\n'){
+				vi_insert_char(ed, '\n');
+			} else if(c == '\b' || c == 0x7f){
+				vi_backspace(ed);
+			} else if(c >= 32 && c <= 126){
+				vi_insert_char(ed, c);
+			}
+			vi_render(ed, 0);
+			continue;
+		}
+
+		if(c == 3 || c == 17){
+			if(ed->dirty && !quit_confirm){
+				quit_confirm = 1;
+				pending_d = 0;
+				pending_z = 0;
+				vi_render(ed, "Ctrl-C again to quit without saving");
+				continue;
+			}
+			ed->quit = 1;
+			break;
+		}
+		quit_confirm = 0;
+
+		if(c == 'd' && pending_d){
+			vi_delete_line(ed);
+			pending_d = 0;
+			pending_z = 0;
+			vi_render(ed, "line deleted");
+			continue;
+		}
+		pending_d = (c == 'd');
+		if(c != 'Z') pending_z = 0;
+
+		if(c == 'h' || c == VI_KEY_LEFT) vi_move_left(ed);
+		else if(c == 'l' || c == VI_KEY_RIGHT) vi_move_right(ed);
+		else if(c == 'j' || c == VI_KEY_DOWN) vi_move_down(ed);
+		else if(c == 'k' || c == VI_KEY_UP) vi_move_up(ed);
+		else if(c == '0') ed->cursor = vi_line_start(ed, ed->cursor);
+		else if(c == '$') ed->cursor = vi_line_end(ed, ed->cursor);
+		else if(c == 'i') ed->mode_insert = 1;
+		else if(c == 'a'){ if(ed->cursor < ed->len) ed->cursor++; ed->mode_insert = 1; }
+		else if(c == 'o'){
+			ed->cursor = vi_line_end(ed, ed->cursor);
+			vi_insert_char(ed, '\n');
+			ed->mode_insert = 1;
+		} else if(c == 'x'){
+			vi_delete_at(ed, ed->cursor);
+			if(ed->cursor > ed->len) ed->cursor = ed->len;
+		} else if(c == 'Q'){
+			ed->quit = 1;
+			break;
+		} else if(c == 'Z' && pending_z){
+			if(vi_save(ed) < 0){
+				pending_z = 0;
+				vi_render(ed, "write failed");
+				continue;
+			}
+			ed->quit = 1;
+			break;
+		} else if(c == 'Z'){
+			pending_z = 1;
+			vi_render(ed, "press Z again to save and quit");
+			continue;
+		} else if(c == ':'){
+			pending_d = 0;
+			pending_z = 0;
+			vi_command_prompt(ed);
+			if(!ed->quit) vi_render(ed, 0);
+			continue;
+		}
+		vi_render(ed, 0);
+	}
+	kfree(ed);
+	uart_set_output_hook(saved_hook);
+	uart_puts("\033[2J\033[H");
+	uart_puts("left vi\n");
+}
+
+static void install_embedded_user_app(void){
+	if(embedded_user_app_size == 0 || embedded_user_app_name[0] == '\0')
+		return;
+
+	char path[64] = "/bin/";
+	int i = 5;
+	for(int j = 0; embedded_user_app_name[j] && i < (int)sizeof(path) - 1; j++)
+		path[i++] = embedded_user_app_name[j];
+	path[i] = '\0';
+
+	int fd = vfs_open(path, O_WRONLY | O_CREAT | O_TRUNC);
+	if(fd < 0){
+		kprintf("failed to install embedded app: %s\n", embedded_user_app_name);
+		return;
+	}
+	vfs_write(fd, embedded_user_app_data, (int)embedded_user_app_size);
+	vfs_close(fd);
+	kprintf("embedded app installed: %s\n", path);
+}
+
+static void install_code_demo(void){
+	static const char demo_src[] =
+		"long u_puts(char *s);\n"
+		"long u_putc(char c);\n"
+		"long u_sleep(long ms);\n"
+		"\n"
+		"char banner;\n"
+		"int values[4];\n"
+		"\n"
+		"int sum_pair(int a, int b){\n"
+		"    return a + b;\n"
+		"}\n"
+		"\n"
+		"int main(void){\n"
+		"    int i;\n"
+		"    int total;\n"
+		"    int *p;\n"
+		"\n"
+		"    banner = 'H';\n"
+		"    values[0] = 1;\n"
+		"    values[1] = 2;\n"
+		"    values[2] = 3;\n"
+		"    values[3] = 4;\n"
+		"\n"
+		"    p = &values[0];\n"
+		"    total = 0;\n"
+		"\n"
+		"    u_puts(\"Tiny C quick demo: \");\n"
+		"    u_putc(banner);\n"
+		"    u_puts(\"\\n\");\n"
+		"\n"
+		"    for(i = 0; i < 4; i = i + 1){\n"
+		"        total = total + p[i];\n"
+		"        u_putc('0' + p[i]);\n"
+		"    }\n"
+		"\n"
+		"    u_puts(\"\\nsum=\");\n"
+		"    u_putc('0' + total);\n"
+		"    u_puts(\"\\npair=\");\n"
+		"    u_putc('0' + sum_pair(values[1], values[2]));\n"
+		"    u_puts(\"\\nsize(long)=\");\n"
+		"    u_putc('0' + sizeof(long));\n"
+		"    u_puts(\"\\n\");\n"
+		"\n"
+		"    u_sleep(100);\n"
+		"    return 0;\n"
+		"}\n";
+
+	int fd = vfs_open("/Code/quick_demo.c", O_WRONLY | O_CREAT | O_TRUNC);
+	if(fd < 0){
+		kprintf("failed to install code demo\n");
+		return;
+	}
+	vfs_write(fd, demo_src, k_strlen(demo_src));
+	vfs_close(fd);
 }
 
 // ── shell working directory ───────────────────────────────────────────────────
@@ -58,6 +638,62 @@ static void build_path(char *out, int outlen, const char *name){
 	}
 }
 
+static void normalize_path(char *path){
+	char out[128];
+	int src = 0;
+	int dst = 0;
+
+	out[dst++] = '/';
+	out[dst] = '\0';
+
+	while(path[src]){
+		int start;
+		int len = 0;
+
+		while(path[src] == '/')
+			src++;
+		if(!path[src])
+			break;
+
+		start = src;
+		while(path[src] && path[src] != '/'){
+			src++;
+			len++;
+		}
+
+		if(len == 1 && path[start] == '.')
+			continue;
+
+		if(len == 2 && path[start] == '.' && path[start + 1] == '.'){
+			if(dst > 1){
+				dst--;
+				while(dst > 1 && out[dst - 1] != '/')
+					dst--;
+				out[dst] = '\0';
+			}
+			continue;
+		}
+
+		if(dst > 1 && dst < (int)sizeof(out) - 1)
+			out[dst++] = '/';
+		for(int i = 0; i < len && dst < (int)sizeof(out) - 1; i++)
+			out[dst++] = path[start + i];
+		out[dst] = '\0';
+	}
+
+	if(dst == 0){
+		out[0] = '/';
+		out[1] = '\0';
+	}
+
+	dst = 0;
+	while(out[dst] && dst < 127){
+		path[dst] = out[dst];
+		dst++;
+	}
+	path[dst] = '\0';
+}
+
 // --- commands ---
 
 static void help_command(){
@@ -72,10 +708,12 @@ static void help_command(){
 	uart_puts("  uptime              time since boot\n");
 	uart_puts("  panic               trigger kernel panic\n");
 	uart_puts("  crashtest <type>    null/assert/brk/undef/align\n");
+#if PLATFORM_HAS_GPIO
 	uart_puts("\n[gpio]\n");
 	uart_puts("  led <pin> <on/off>  set GPIO pin output\n");
 	uart_puts("  blink <pin>         blink GPIO pin 5 times\n");
 	uart_puts("  readpin <pin>       read GPIO pin state\n");
+#endif
 	uart_puts("\n[timer/irq]\n");
 	uart_puts("  ticks               show timer IRQ count\n");
 	uart_puts("  irqtest             count IRQs over 3s\n");
@@ -108,23 +746,34 @@ static void help_command(){
 	uart_puts("  rm <name>           remove file or empty directory\n");
 	uart_puts("  cd <path>           change working directory\n");
 	uart_puts("  pwd                 print working directory\n");
+	uart_puts("  tcc <src> -o <out>  host-side Tiny C compiler (see repo ./tcc)\n");
+	uart_puts("  toycc <src> -o <out> in-kernel toy Tiny C bytecode compiler\n");
+	uart_puts("  vi <file>           open vi-like editor\n");
 	uart_puts("  exec <path>         load ELF binary from VFS and run it\n");
+#if PLATFORM_HAS_USB_KEYBOARD
 	uart_puts("\n[keyboard]\n");
 	uart_puts("  kbinit              init USB HID keyboard (DWC2 OTG)\n");
+#endif
+#if PLATFORM_HAS_SD
 	uart_puts("\n[sd card / fat32]\n");
 	uart_puts("  sdinit              initialize SD card\n");
 	uart_puts("  sdls [path]         list directory on SD card (FAT32)\n");
 	uart_puts("  sdcat <path>        print file from SD card\n");
 	uart_puts("  sdexec <path>       load and run ELF from SD card\n");
 	uart_puts("  mount               copy /bin/* from SD into VFS /bin\n");
+#endif
+#if PLATFORM_HAS_FRAMEBUFFER
 	uart_puts("\n[framebuffer]\n");
 	uart_puts("  fbtest              draw test pattern on framebuffer\n");
 	uart_puts("  fbmirror            toggle horizontal mirror (QEMU fix)\n");
 	uart_puts("  home                launch live desktop (auto-updates)\n");
 	uart_puts("  home stop           close the desktop\n");
+#endif
 	uart_puts("\n[self-tests]\n");
 	uart_puts("  test_uart           test UART and string library\n");
+#if PLATFORM_HAS_GPIO
 	uart_puts("  test_gpio           test GPIO driver\n");
+#endif
 	uart_puts("  test_timer          test timer driver\n");
 	uart_puts("  test_alloc          test memory allocator\n");
 	uart_puts("  test_all            run all self-tests\n");
@@ -149,6 +798,11 @@ static void echo_command(const char *arg){
 
 // led <pin> <on/off>
 static void led_command(const char *arg){
+#if !PLATFORM_HAS_GPIO
+	(void)arg;
+	unsupported_command("gpio");
+	return;
+#else
 	int pin = k_atoi(arg);
 	arg = next_arg(arg);
 	gpio_set_function(pin, GPIO_FUNC_OUTPUT);
@@ -161,10 +815,16 @@ static void led_command(const char *arg){
 	} else {
 		uart_puts("usage: led <pin> <on/off>\n");
 	}
+#endif
 }
 
 // blink <pin>
 static void blink_command(const char *arg){
+#if !PLATFORM_HAS_GPIO
+	(void)arg;
+	unsupported_command("gpio");
+	return;
+#else
 	int pin = k_atoi(arg);
 	gpio_set_function(pin, GPIO_FUNC_OUTPUT);
 	uart_puts("blinking pin ");
@@ -179,10 +839,16 @@ static void blink_command(const char *arg){
 		delay_ms(500);
 	}
 	uart_puts("done\n");
+#endif
 }
 
 // readpin <pin>
 static void readpin_command(const char *arg){
+#if !PLATFORM_HAS_GPIO
+	(void)arg;
+	unsupported_command("gpio");
+	return;
+#else
 	int pin = k_atoi(arg);
 	gpio_set_function(pin, GPIO_FUNC_INPUT);
 	int val = gpio_read(pin);
@@ -194,12 +860,14 @@ static void readpin_command(const char *arg){
 		uart_puts(": HIGH\n");
 	else
 		uart_puts(": LOW\n");
+#endif
 }
 
 static void uptime_command(){
 	unsigned long ticks = timer_get_ticks();
-	unsigned long secs = ticks / 1000000;
-	unsigned long frac = (ticks / 1000) % 1000;
+	unsigned long hz = timer_clock_hz();
+	unsigned long secs = ticks / hz;
+	unsigned long frac = ((ticks % hz) * 1000UL) / hz;
 	char buf[12];
 	itoa((int)secs, buf, 12);
 	uart_puts(buf);
@@ -416,7 +1084,11 @@ static void sleep_command(const char *arg){
 	uart_puts("sleeping ");
 	uart_puts(buf);
 	uart_puts("ms...\n");
+#if PLATFORM_INIT_IRQS
 	task_sleep_ms(ms);
+#else
+	delay_ms(ms);
+#endif
 	uart_puts("woke up\n");
 }
 
@@ -429,6 +1101,10 @@ static void yield_command(){
 // --- framebuffer test ---
 
 static void fbtest_command(){
+#if !PLATFORM_HAS_FRAMEBUFFER
+	unsupported_command("framebuffer");
+	return;
+#else
 	if(fb_width() == 0){
 		kprintf("no framebuffer\n");
 		return;
@@ -450,6 +1126,7 @@ static void fbtest_command(){
 	// reset console below test area
 	fb_console_init(0xFFFFFFFF, 0xFF000020);
 	kprintf("fbtest: drew test pattern\n");
+#endif
 }
 
 // --- spinlock test ---
@@ -619,6 +1296,7 @@ static void pwd_command(void){
 static void cd_command(const char *arg){
 	char path[128];
 	build_path(path, 128, arg);
+	normalize_path(path);
 	int inode = vfs_resolve(path);
 	if(inode < 0 || vfs_inode_type(inode) != VFS_DIR){
 		uart_puts("no such directory: ");
@@ -734,13 +1412,18 @@ static void cat_command(const char *arg){
 		uart_puts("\n");
 		return;
 	}
-	char buf[VFS_MAX_FSIZE + 1];
-	int len = vfs_read(fd, buf, VFS_MAX_FSIZE);
+	char buf[128];
+	int last = '\n';
+	while(1){
+		int len = vfs_read(fd, buf, sizeof(buf) - 1);
+		if(len <= 0)
+			break;
+		buf[len] = '\0';
+		uart_puts(buf);
+		last = (unsigned char)buf[len - 1];
+	}
 	vfs_close(fd);
-	if(len < 0) len = 0;
-	buf[len] = '\0';
-	uart_puts(buf);
-	if(len > 0 && buf[len-1] != '\n') uart_puts("\n");
+	if(last != '\n') uart_puts("\n");
 }
 
 static void rm_command(const char *arg){
@@ -757,6 +1440,63 @@ static void rm_command(const char *arg){
 	}
 }
 
+static void toycc_command(const char *arg){
+	char src_name[64];
+	char out_name[64];
+	int i = 0;
+
+	while(*arg == ' ') arg++;
+	while(arg[i] && arg[i] != ' ' && i < (int)sizeof(src_name) - 1){
+		src_name[i] = arg[i];
+		i++;
+	}
+	src_name[i] = '\0';
+	arg += i;
+	while(*arg == ' ') arg++;
+
+	if(src_name[0] == '\0' || !str_starts_with(arg, "-o ")){
+		uart_puts("usage: toycc <src> -o <out>\n");
+		return;
+	}
+
+	arg += 3;
+	while(*arg == ' ') arg++;
+	i = 0;
+	while(arg[i] && arg[i] != ' ' && i < (int)sizeof(out_name) - 1){
+		out_name[i] = arg[i];
+		i++;
+	}
+	out_name[i] = '\0';
+
+	if(out_name[0] == '\0'){
+		uart_puts("usage: toycc <src> -o <out>\n");
+		return;
+	}
+
+	char src_path[128];
+	char out_path[128];
+	build_path(src_path, 128, src_name);
+	build_path(out_path, 128, out_name);
+
+	if(tinycc_compile(src_path, out_path) < 0){
+		uart_puts("toycc failed\n");
+		uart_puts("supported subset: int vars, assignments/+=/++/--, if/else, do/while/for, break/continue, ! && ||, +-*/% comparisons, u_puts(\"...\"), u_putc(expr), u_sleep(expr), return expr;\n");
+		return;
+	}
+
+	uart_puts("toycc compiled '");
+	uart_puts(src_name);
+	uart_puts("' -> '");
+	uart_puts(out_name);
+	uart_puts("'\n");
+}
+
+static void tcc_command(const char *arg){
+	(void)arg;
+	uart_puts("tcc is the real Tiny C compiler on the host side.\n");
+	uart_puts("use ./tcc <src> -o <out> in the repo, or use toycc here for the in-kernel subset.\n");
+}
+
 // exec <vfs-path>  — load ELF64 binary from VFS and run it as a user task
 static void exec_command(const char *arg){
 	char path[128];
@@ -767,7 +1507,11 @@ static void exec_command(const char *arg){
 	for(const char *p = arg; *p; p++)
 		if(*p == '/') name = p + 1;
 
-	int tid = elf_exec(path, name);
+	int tid;
+	if(tinycc_is_program(path))
+		tid = tinycc_exec(path, name);
+	else
+		tid = elf_exec(path, name);
 	if(tid < 0){
 		uart_puts("exec failed\n");
 	} else {
@@ -776,7 +1520,20 @@ static void exec_command(const char *arg){
 		uart_puts("exec: task ");
 		uart_puts(buf);
 		uart_puts(" started\n");
+		if(!PLATFORM_INIT_IRQS){
+			uart_puts("exec: switching to task now\n");
+			yield();
+			uart_puts("exec: task returned\n");
+		}
 	}
+}
+
+static void exec_shortcut_command(const char *arg){
+	if(!arg || !*arg){
+		uart_puts("usage: ./<program>\n");
+		return;
+	}
+	exec_command(arg);
 }
 
 // --- SD card / FAT32 commands ---
@@ -1044,16 +1801,28 @@ static void check_keywords(const char *buffer){
 	} else if(str_eq(buffer, "fbtest")){
 		fbtest_command();
 	} else if(str_eq(buffer, "fbmirror")){
+#if PLATFORM_HAS_FRAMEBUFFER
 		int m = !fb_get_mirror();
 		fb_set_mirror(m);
 		kprintf("fb mirror: %s\n", m ? "on" : "off");
+#else
+		unsupported_command("framebuffer");
+#endif
 	} else if(str_eq(buffer, "home stop")){
+#if PLATFORM_HAS_FRAMEBUFFER
 		home_stop();
 		kprintf("desktop stopped\n");
+#else
+		unsupported_command("framebuffer");
+#endif
 	} else if(str_eq(buffer, "home")){
+#if PLATFORM_HAS_FRAMEBUFFER
 		if(fb_width() == 0){ kprintf("no framebuffer\n"); }
 		else if(home_active()){ kprintf("desktop already running\n"); }
 		else { home_start(); kprintf("desktop started\n"); }
+#else
+		unsupported_command("framebuffer");
+#endif
 	} else if(str_eq(buffer, "locktest")){
 		locktest_command();
 	} else if(str_eq(buffer, "semtest")){
@@ -1078,32 +1847,72 @@ static void check_keywords(const char *buffer){
 		write_command(buffer + 6);
 	} else if(str_starts_with(buffer, "cat ")){
 		cat_command(buffer + 4);
+	} else if(str_starts_with(buffer, "toycc ")){
+		toycc_command(buffer + 6);
+	} else if(str_starts_with(buffer, "tcc ")){
+		tcc_command(buffer + 4);
+	} else if(str_starts_with(buffer, "vi ")){
+		vi_open_command(buffer + 3);
 	} else if(str_starts_with(buffer, "rm ")){
 		rm_command(buffer + 3);
+	} else if(str_starts_with(buffer, "./")){
+		exec_shortcut_command(buffer + 2);
 	} else if(str_starts_with(buffer, "exec ")){
 		exec_command(buffer + 5);
 	} else if(str_eq(buffer, "kbinit")){
+#if PLATFORM_HAS_USB_KEYBOARD
 		uart_puts("initializing USB keyboard...\n");
 		if(kb_init() == 0)
 			uart_puts("keyboard ready\n");
 		else
 			uart_puts("keyboard init failed (no USB keyboard?)\n");
+#else
+		unsupported_command("USB keyboard");
+#endif
 	} else if(str_eq(buffer, "sdinit")){
+#if PLATFORM_HAS_SD
 		sdinit_command();
+#else
+		unsupported_command("sd card");
+#endif
 	} else if(str_starts_with(buffer, "sdls ")){
+#if PLATFORM_HAS_SD
 		sdls_command(buffer + 5);
+#else
+		unsupported_command("sd card");
+#endif
 	} else if(str_eq(buffer, "sdls")){
+#if PLATFORM_HAS_SD
 		sdls_command("/");
+#else
+		unsupported_command("sd card");
+#endif
 	} else if(str_starts_with(buffer, "sdcat ")){
+#if PLATFORM_HAS_SD
 		sdcat_command(buffer + 6);
+#else
+		unsupported_command("sd card");
+#endif
 	} else if(str_starts_with(buffer, "sdexec ")){
+#if PLATFORM_HAS_SD
 		sdexec_command(buffer + 7);
+#else
+		unsupported_command("sd card");
+#endif
 	} else if(str_eq(buffer, "mount")){
+#if PLATFORM_HAS_SD
 		mount_command();
+#else
+		unsupported_command("sd card");
+#endif
 	} else if(str_eq(buffer, "test_uart")){
 		test_uart_command();
 	} else if(str_eq(buffer, "test_gpio")){
+#if PLATFORM_HAS_GPIO
 		test_gpio_command();
+#else
+		unsupported_command("gpio");
+#endif
 	} else if(str_eq(buffer, "test_timer")){
 		test_timer_command();
 	} else if(str_eq(buffer, "test_alloc")){
@@ -1119,14 +1928,27 @@ static void check_keywords(const char *buffer){
 // Blocks until a character is available; polls keyboard every ~1ms.
 static char shell_getc(void){
 	while(1){
-		// poll USB keyboard for new HID reports (~1ms cadence)
-		kb_poll();
-		if(kb_ready()) return kb_getc();
-		// check UART IRQ ring buffer
-		int c = uart_irq_getc();
+		int c = shell_try_getc();
 		if(c >= 0) return (char)c;
 		delay_us(1000);
 	}
+}
+
+static int shell_try_getc(void){
+	if(shell_unget_buf >= 0){
+		int c = shell_unget_buf;
+		shell_unget_buf = -1;
+		return c;
+	}
+	kb_poll();
+	if(kb_ready()) return (unsigned char)kb_getc();
+	int c = uart_irq_getc();
+	if(c >= 0) return c;
+	return uart_poll_getc();
+}
+
+static void shell_ungetc(char c){
+	shell_unget_buf = (unsigned char)c;
 }
 
 static void query_terminal(char *terminalBuffer, int maxLen){
@@ -1134,9 +1956,27 @@ static void query_terminal(char *terminalBuffer, int maxLen){
 		uart_puts(">");
 		// Read a line from either USB keyboard or UART
 		int i = 0;
+		int history_index = shell_history_count;
 		while(i < maxLen - 1){
-			char c = shell_getc();
+			int c = vi_read_key();
 			if(c == '\r' || c == '\n') break;
+			if(c == VI_KEY_UP){
+				if(shell_history_count > 0 && history_index > 0){
+					history_index--;
+					shell_replace_line(terminalBuffer, maxLen, shell_history[history_index], &i);
+				}
+				continue;
+			}
+			if(c == VI_KEY_DOWN){
+				if(history_index < shell_history_count - 1){
+					history_index++;
+					shell_replace_line(terminalBuffer, maxLen, shell_history[history_index], &i);
+				} else if(history_index == shell_history_count - 1){
+					history_index = shell_history_count;
+					shell_replace_line(terminalBuffer, maxLen, "", &i);
+				}
+				continue;
+			}
 			if(c == '\b' || c == 0x7f){  // backspace / delete
 				if(i > 0){
 					uart_putc('\b'); uart_putc(' '); uart_putc('\b');
@@ -1150,12 +1990,13 @@ static void query_terminal(char *terminalBuffer, int maxLen){
 		}
 		terminalBuffer[i] = '\0';
 		uart_puts("\n");
+		shell_store_history(terminalBuffer);
 		check_keywords(terminalBuffer);
 	}
 }
 
 void kernel_main(void) {
-	int terminal_Len = 100;
+	int terminal_Len = SHELL_LINE_MAX;
 	char terminal_Buffer[terminal_Len];
 
 	cpu_install_vectors();
@@ -1176,27 +2017,36 @@ void kernel_main(void) {
 	alloc_init();
 	kprintf("heap initialized\n");
 
-	// set up MMU
-	mmu_init();
-	kprintf("MMU enabled\n");
-
-	// set up framebuffer
-	if(fb_init(640, 480) == 0){
-		kprintf("framebuffer: 640x480x32 pitch=%d\n", fb_pitch());
-		fb_console_init(0xFFFFFFFF, 0xFF000020); // white on dark blue
-		fb_console_puts("HudOS framebuffer initialized\n");
+	if(PLATFORM_INIT_MMU){
+		mmu_init();
+		kprintf("MMU enabled\n");
 	} else {
-		kprintf("framebuffer: init failed (serial only)\n");
+		kprintf("MMU skipped on this platform\n");
 	}
 
-	// set up interrupts
-	irq_init();
-	timer_init(10);              // timer IRQ every 10ms (100Hz tick)
-	uart_irq_enable();
-	irq_enable(IRQ_UART);
-	cpu_enable_irqs();
+	if(PLATFORM_HAS_FRAMEBUFFER){
+		if(fb_init(640, 480) == 0){
+			kprintf("framebuffer: 640x480x32 pitch=%d\n", fb_pitch());
+			fb_console_init(0xFFFFFFFF, 0xFF000020); // white on dark blue
+			uart_set_output_hook(fb_console_putc);
+			fb_console_puts("HudOS framebuffer initialized\n");
+		} else {
+			kprintf("framebuffer: init failed (serial only)\n");
+		}
+	} else {
+		kprintf("framebuffer: unavailable on this platform\n");
+	}
 
-	kprintf("IRQs enabled (timer 10ms, UART RX)\n");
+	if(PLATFORM_INIT_IRQS){
+		irq_init();
+		timer_init(10);              // timer IRQ every 10ms (100Hz tick)
+		uart_irq_enable();
+		irq_enable(IRQ_UART);
+		cpu_enable_irqs();
+		kprintf("IRQs enabled (timer 10ms, UART RX)\n");
+	} else {
+		kprintf("IRQs skipped on this platform (polling serial)\n");
+	}
 	kprintf("timer freq: %x Hz\n", timer_get_freq());
 
 	// initialize task system
@@ -1206,11 +2056,23 @@ void kernel_main(void) {
 	// initialize virtual filesystem and standard directory tree
 	vfs_init();
 	vfs_mkdir("/bin");     // executables
+	vfs_mkdir("/Code");    // demo source files
 	vfs_mkdir("/etc");     // config files
 	vfs_mkdir("/home");    // user home
 	vfs_mkdir("/var");
 	vfs_mkdir("/var/log"); // logs
 	kprintf("vfs initialized\n");
+	install_embedded_user_app();
+	install_code_demo();
+
+	if(PLATFORM_HAS_USB_KEYBOARD){
+		if(kb_init() == 0)
+			kprintf("USB keyboard initialized\n");
+		else
+			kprintf("USB keyboard not detected; serial input still available\n");
+	} else {
+		kprintf("USB keyboard support unavailable on this platform\n");
+	}
 
 	query_terminal(terminal_Buffer, terminal_Len);
 

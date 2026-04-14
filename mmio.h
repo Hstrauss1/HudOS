@@ -3,7 +3,9 @@
 #ifndef MMIO_H
 #define MMIO_H
 
-#define UART0_BASE 0xFE201000UL  //base
+#include "platform.h"
+
+#define UART0_BASE PLATFORM_UART_BASE  //base
 #define UART0_DR   (*(volatile unsigned int *)(UART0_BASE + 0x00)) //Data Reg I/O
 #define UART0_FR   (*(volatile unsigned int *)(UART0_BASE + 0x18)) //Flag Status Reg bit4 recieve empty 5 transmit full
 #define UART0_IBRD (*(volatile unsigned int *)(UART0_BASE + 0x24)) //baud rate
@@ -56,7 +58,7 @@
 #define LOCAL_TIMER_HP_IRQ      (1 << 2) //hypervisor physical timer (EL2)
 
 // GIC-400 (BCM2711, used by QEMU raspi4b for interrupt routing)
-#define GIC_BASE        0xFF841000UL
+#define GIC_BASE        PLATFORM_GICD_BASE
 #define GICD_CTLR       (*(volatile unsigned int *)(GIC_BASE + 0x000))  //distributor control
 #define GICD_IGROUPR(n)   (*(volatile unsigned int *)(GIC_BASE + 0x080 + (n)*4)) //interrupt group
 #define GICD_ISENABLER(n) (*(volatile unsigned int *)(GIC_BASE + 0x100 + (n)*4)) //set-enable
@@ -64,7 +66,7 @@
 #define GICD_ISPENDR(n)   (*(volatile unsigned int *)(GIC_BASE + 0x200 + (n)*4)) //set-pending
 #define GICD_IPRIORITYR(n) (*(volatile unsigned int *)(GIC_BASE + 0x400 + (n)*4)) //priority
 #define GICD_ITARGETSR(n)  (*(volatile unsigned int *)(GIC_BASE + 0x800 + (n)*4)) //target CPU
-#define GICC_BASE       0xFF842000UL
+#define GICC_BASE       PLATFORM_GICC_BASE
 #define GICC_CTLR       (*(volatile unsigned int *)(GICC_BASE + 0x000))  //CPU interface control
 #define GICC_PMR        (*(volatile unsigned int *)(GICC_BASE + 0x004))  //priority mask
 #define GICC_IAR        (*(volatile unsigned int *)(GICC_BASE + 0x00C))  //interrupt acknowledge

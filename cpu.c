@@ -254,9 +254,9 @@ int exception_handler(int type, unsigned long *regs){
 }
 
 void cpu_enable_irqs(void){
-	__asm__ volatile("msr DAIFClr, #2");
+	__asm__ volatile("msr DAIFClr, #3");
 }
 
 void cpu_disable_irqs(void){
-	__asm__ volatile("msr DAIFSet, #2");
+	__asm__ volatile("msr DAIFSet, #3");
 }

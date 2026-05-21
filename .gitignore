@@ -3,3 +3,7 @@ kernel.o
 kernel8.img
 Makefile
 *.o
+tiny_c_compiler/scc
+tiny_c_compiler/out/
+*.*
+CLAUDE.md

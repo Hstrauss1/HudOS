@@ -81,12 +81,7 @@ VECTOR_ENTRY curr_el_sp0_irq
 
 VECTOR_ENTRY curr_el_sp0_fiq
     SAVE_CONTEXT
-    mov x0, #2
-    mov x1, sp
-    bl  exception_handler
-    cbnz w0, 1f
-    b   halt
-1:
+    bl  irq_handler
     RESTORE_CONTEXT
     eret
 
@@ -117,12 +112,7 @@ VECTOR_ENTRY curr_el_spx_irq
 
 VECTOR_ENTRY curr_el_spx_fiq
     SAVE_CONTEXT
-    mov x0, #2
-    mov x1, sp
-    bl  exception_handler
-    cbnz w0, 1f
-    b   halt
-1:
+    bl  irq_handler
     RESTORE_CONTEXT
     eret
 
@@ -178,12 +168,7 @@ VECTOR_ENTRY lower_el_a64_irq
 
 VECTOR_ENTRY lower_el_a64_fiq
     SAVE_CONTEXT
-    mov x0, #2
-    mov x1, sp
-    bl  exception_handler
-    cbnz w0, 1f
-    b   halt
-1:
+    bl  irq_handler
     RESTORE_CONTEXT
     eret
 
@@ -214,12 +199,7 @@ VECTOR_ENTRY lower_el_a32_irq
 
 VECTOR_ENTRY lower_el_a32_fiq
     SAVE_CONTEXT
-    mov x0, #2
-    mov x1, sp
-    bl  exception_handler
-    cbnz w0, 1f
-    b   halt
-1:
+    bl  irq_handler
     RESTORE_CONTEXT
     eret
 

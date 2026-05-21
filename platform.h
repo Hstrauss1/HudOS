@@ -17,7 +17,7 @@
 #define PLATFORM_HAS_USB_KEYBOARD  0
 #define PLATFORM_HAS_SD            0
 #define PLATFORM_INIT_MMU          0
-#define PLATFORM_INIT_IRQS         0
+#define PLATFORM_INIT_IRQS         1
 #define PLATFORM_USES_MMIO_TIMER   0
 
 #else

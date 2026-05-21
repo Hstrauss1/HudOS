@@ -565,42 +565,20 @@ static void install_code_demo(void){
 		"long u_putc(char c);\n"
 		"long u_sleep(long ms);\n"
 		"\n"
-		"char banner;\n"
-		"int values[4];\n"
-		"\n"
-		"int sum_pair(int a, int b){\n"
-		"    return a + b;\n"
-		"}\n"
-		"\n"
 		"int main(void){\n"
 		"    int i;\n"
 		"    int total;\n"
-		"    int *p;\n"
-		"\n"
-		"    banner = 'H';\n"
-		"    values[0] = 1;\n"
-		"    values[1] = 2;\n"
-		"    values[2] = 3;\n"
-		"    values[3] = 4;\n"
-		"\n"
-		"    p = &values[0];\n"
 		"    total = 0;\n"
 		"\n"
-		"    u_puts(\"Tiny C quick demo: \");\n"
-		"    u_putc(banner);\n"
-		"    u_puts(\"\\n\");\n"
+		"    u_puts(\"Tiny C quick demo\\n\");\n"
 		"\n"
 		"    for(i = 0; i < 4; i = i + 1){\n"
-		"        total = total + p[i];\n"
-		"        u_putc('0' + p[i]);\n"
+		"        total = total + i;\n"
+		"        u_putc('0' + i);\n"
 		"    }\n"
 		"\n"
 		"    u_puts(\"\\nsum=\");\n"
 		"    u_putc('0' + total);\n"
-		"    u_puts(\"\\npair=\");\n"
-		"    u_putc('0' + sum_pair(values[1], values[2]));\n"
-		"    u_puts(\"\\nsize(long)=\");\n"
-		"    u_putc('0' + sizeof(long));\n"
 		"    u_puts(\"\\n\");\n"
 		"\n"
 		"    u_sleep(100);\n"
@@ -746,8 +724,8 @@ static void help_command(){
 	uart_puts("  rm <name>           remove file or empty directory\n");
 	uart_puts("  cd <path>           change working directory\n");
 	uart_puts("  pwd                 print working directory\n");
-	uart_puts("  tcc <src> -o <out>  host-side Tiny C compiler (see repo ./tcc)\n");
-	uart_puts("  toycc <src> -o <out> in-kernel toy Tiny C bytecode compiler\n");
+	uart_puts("  tcc <src> -o <out>  compile Tiny C program in HudOS\n");
+	uart_puts("  toycc <src> -o <out> alias for the in-kernel Tiny C compiler\n");
 	uart_puts("  vi <file>           open vi-like editor\n");
 	uart_puts("  exec <path>         load ELF binary from VFS and run it\n");
 #if PLATFORM_HAS_USB_KEYBOARD
@@ -1440,7 +1418,7 @@ static void rm_command(const char *arg){
 	}
 }
 
-static void toycc_command(const char *arg){
+static void tcc_compile_command(const char *arg, const char *label){
 	char src_name[64];
 	char out_name[64];
 	int i = 0;
@@ -1455,7 +1433,9 @@ static void toycc_command(const char *arg){
 	while(*arg == ' ') arg++;
 
 	if(src_name[0] == '\0' || !str_starts_with(arg, "-o ")){
-		uart_puts("usage: toycc <src> -o <out>\n");
+		uart_puts("usage: ");
+		uart_puts(label);
+		uart_puts(" <src> -o <out>\n");
 		return;
 	}
 
@@ -1469,7 +1449,9 @@ static void toycc_command(const char *arg){
 	out_name[i] = '\0';
 
 	if(out_name[0] == '\0'){
-		uart_puts("usage: toycc <src> -o <out>\n");
+		uart_puts("usage: ");
+		uart_puts(label);
+		uart_puts(" <src> -o <out>\n");
 		return;
 	}
 
@@ -1479,12 +1461,14 @@ static void toycc_command(const char *arg){
 	build_path(out_path, 128, out_name);
 
 	if(tinycc_compile(src_path, out_path) < 0){
-		uart_puts("toycc failed\n");
+		uart_puts(label);
+		uart_puts(" failed\n");
 		uart_puts("supported subset: int vars, assignments/+=/++/--, if/else, do/while/for, break/continue, ! && ||, +-*/% comparisons, u_puts(\"...\"), u_putc(expr), u_sleep(expr), return expr;\n");
 		return;
 	}
 
-	uart_puts("toycc compiled '");
+	uart_puts(label);
+	uart_puts(" compiled '");
 	uart_puts(src_name);
 	uart_puts("' -> '");
 	uart_puts(out_name);
@@ -1492,9 +1476,11 @@ static void toycc_command(const char *arg){
 }
 
 static void tcc_command(const char *arg){
-	(void)arg;
-	uart_puts("tcc is the real Tiny C compiler on the host side.\n");
-	uart_puts("use ./tcc <src> -o <out> in the repo, or use toycc here for the in-kernel subset.\n");
+	tcc_compile_command(arg, "tcc");
+}
+
+static void toycc_command(const char *arg){
+	tcc_compile_command(arg, "toycc");
 }
 
 // exec <vfs-path>  — load ELF64 binary from VFS and run it as a user task
@@ -1533,7 +1519,22 @@ static void exec_shortcut_command(const char *arg){
 		uart_puts("usage: ./<program>\n");
 		return;
 	}
-	exec_command(arg);
+
+	char prog[64];
+	int i = 0;
+	while(arg[i] && arg[i] != ' ' && i < (int)sizeof(prog) - 1){
+		prog[i] = arg[i];
+		i++;
+	}
+	prog[i] = '\0';
+
+	if(str_eq(prog, "tcc")){
+		uart_puts("tcc is a shell compile command, not an executable in the VFS.\n");
+		uart_puts("use: tcc <src> -o <out>\n");
+		return;
+	}
+
+	exec_command(prog);
 }
 
 // --- SD card / FAT32 commands ---
@@ -1847,10 +1848,10 @@ static void check_keywords(const char *buffer){
 		write_command(buffer + 6);
 	} else if(str_starts_with(buffer, "cat ")){
 		cat_command(buffer + 4);
-	} else if(str_starts_with(buffer, "toycc ")){
-		toycc_command(buffer + 6);
 	} else if(str_starts_with(buffer, "tcc ")){
 		tcc_command(buffer + 4);
+	} else if(str_starts_with(buffer, "toycc ")){
+		toycc_command(buffer + 6);
 	} else if(str_starts_with(buffer, "vi ")){
 		vi_open_command(buffer + 3);
 	} else if(str_starts_with(buffer, "rm ")){
@@ -1928,8 +1929,12 @@ static void check_keywords(const char *buffer){
 // Blocks until a character is available; polls keyboard every ~1ms.
 static char shell_getc(void){
 	while(1){
+		if(PLATFORM_INIT_IRQS)
+			(void)irq_poll();
 		int c = shell_try_getc();
 		if(c >= 0) return (char)c;
+		if(task_count() > 1)
+			yield();
 		delay_us(1000);
 	}
 }
@@ -1949,6 +1954,173 @@ static int shell_try_getc(void){
 
 static void shell_ungetc(char c){
 	shell_unget_buf = (unsigned char)c;
+}
+
+static int shell_prefix_match(const char *text, const char *prefix){
+	int n = k_strlen(prefix);
+	return k_strncmp(text, prefix, n) == 0;
+}
+
+static int shell_is_path_command(const char *cmd){
+	return str_eq(cmd, "cd") ||
+	       str_eq(cmd, "ls") ||
+	       str_eq(cmd, "cat") ||
+	       str_eq(cmd, "tcc") ||
+	       str_eq(cmd, "toycc") ||
+	       str_eq(cmd, "vi") ||
+	       str_eq(cmd, "rm") ||
+	       str_eq(cmd, "exec") ||
+	       str_eq(cmd, "mkdir") ||
+	       str_eq(cmd, "mkfile");
+}
+
+static int shell_complete_command(char *buffer, int cap, int *len_io){
+	static const char *commands[] = {
+		"help", "info", "why", "clear", "echo", "led", "blink", "readpin",
+		"uptime", "el", "panic", "crashtest", "ticks", "irqtest", "timerdbg",
+		"peek", "poke", "dump", "heapinfo", "malloc", "free", "tasks",
+		"spawn", "kill", "sleep", "yield", "uspawn", "fbtest", "fbmirror",
+		"home", "home stop", "locktest", "semtest", "mqtest", "mutextest",
+		"pwd", "cd", "ls", "mkdir", "mkfile", "write", "cat", "tcc",
+		"toycc", "vi", "rm", "exec", "kbinit", "sdinit", "sdls", "sdcat",
+		"sdexec", "mount", "test_uart", "test_gpio", "test_timer",
+		"test_alloc", "test_all", 0
+	};
+	const char *match = 0;
+	int count = 0;
+	int len = *len_io;
+
+	if(len <= 0 || len >= cap)
+		return 0;
+
+	for(int idx = 0; commands[idx]; idx++){
+		if(shell_prefix_match(commands[idx], buffer)){
+			match = commands[idx];
+			count++;
+		}
+	}
+
+	if(count != 1 || !match)
+		return 0;
+
+	int match_len = k_strlen(match);
+	if(match_len + 1 >= cap)
+		return 0;
+	if(match_len == len && len > 0 && buffer[len - 1] == ' ')
+		return 0;
+
+	for(int i = 0; i < match_len; i++)
+		buffer[i] = match[i];
+	buffer[match_len++] = ' ';
+	buffer[match_len] = '\0';
+	shell_replace_line(buffer, cap, buffer, len_io);
+	return 1;
+}
+
+static int shell_complete_path(char *buffer, int cap, int *len_io){
+	char cmd[32];
+	char token[128];
+	char base[128];
+	char replacement[128];
+	char match_name[32];
+	int token_start = *len_io;
+	int cmd_len = 0;
+	int match_inode = -1;
+	int count = 0;
+
+	while(token_start > 0 && buffer[token_start - 1] != ' ')
+		token_start--;
+
+	if(token_start == 0){
+		if(!(buffer[0] == '.' || buffer[0] == '/'))
+			return 0;
+	} else {
+		while(cmd_len < token_start - 1 && cmd_len < (int)sizeof(cmd) - 1 &&
+		      buffer[cmd_len] != ' '){
+			cmd[cmd_len] = buffer[cmd_len];
+			cmd_len++;
+		}
+		cmd[cmd_len] = '\0';
+		if(!shell_is_path_command(cmd))
+			return 0;
+	}
+
+	int token_len = *len_io - token_start;
+	if(token_len < 0 || token_len >= (int)sizeof(token))
+		return 0;
+	for(int i = 0; i < token_len; i++)
+		token[i] = buffer[token_start + i];
+	token[token_len] = '\0';
+
+	int slash = -1;
+	for(int i = 0; i < token_len; i++)
+		if(token[i] == '/')
+			slash = i;
+
+	if(slash >= 0){
+		char dir_part[128];
+		int dir_len = slash;
+		if(dir_len >= (int)sizeof(dir_part))
+			return 0;
+		for(int i = 0; i < dir_len; i++)
+			dir_part[i] = token[i];
+		dir_part[dir_len] = '\0';
+		if(token[0] == '/' && dir_len == 0){
+			base[0] = '/';
+			base[1] = '\0';
+		} else {
+			build_path(base, sizeof(base), dir_part);
+			normalize_path(base);
+		}
+	} else {
+		build_path(base, sizeof(base), ".");
+		normalize_path(base);
+	}
+
+	int dir = vfs_resolve(base);
+	if(dir < 0 || vfs_inode_type(dir) != VFS_DIR)
+		return 0;
+
+	const char *name_prefix = (slash >= 0) ? (token + slash + 1) : token;
+	for(int inode = 0; inode < vfs_max_inodes(); inode++){
+		const char *name;
+		if(!vfs_inode_used(inode) || vfs_inode_parent(inode) != dir)
+			continue;
+		name = vfs_inode_name(inode);
+		if(!shell_prefix_match(name, name_prefix))
+			continue;
+		str_copy_limit(match_name, name, sizeof(match_name));
+		match_inode = inode;
+		count++;
+	}
+
+	if(count != 1 || match_inode < 0)
+		return 0;
+
+	int out = 0;
+	for(int i = 0; i < token_start && out < (int)sizeof(replacement) - 1; i++)
+		replacement[out++] = buffer[i];
+	if(slash >= 0){
+		for(int i = 0; i <= slash && out < (int)sizeof(replacement) - 1; i++)
+			replacement[out++] = token[i];
+	}
+	for(int i = 0; match_name[i] && out < (int)sizeof(replacement) - 2; i++)
+		replacement[out++] = match_name[i];
+	if(vfs_inode_type(match_inode) == VFS_DIR)
+		replacement[out++] = '/';
+	else
+		replacement[out++] = ' ';
+	replacement[out] = '\0';
+	if(out >= cap)
+		return 0;
+	shell_replace_line(buffer, cap, replacement, len_io);
+	return 1;
+}
+
+static void shell_autocomplete(char *buffer, int cap, int *len_io){
+	if(shell_complete_path(buffer, cap, len_io))
+		return;
+	(void)shell_complete_command(buffer, cap, len_io);
 }
 
 static void query_terminal(char *terminalBuffer, int maxLen){
@@ -1982,6 +2154,12 @@ static void query_terminal(char *terminalBuffer, int maxLen){
 					uart_putc('\b'); uart_putc(' '); uart_putc('\b');
 					i--;
 				}
+				continue;
+			}
+			if(c == '\t'){
+				terminalBuffer[i] = '\0';
+				shell_autocomplete(terminalBuffer, maxLen, &i);
+				history_index = shell_history_count;
 				continue;
 			}
 			if(c < 32 || c > 126) continue; // ignore non-printable

@@ -71,6 +71,8 @@
 #define GICC_PMR        (*(volatile unsigned int *)(GICC_BASE + 0x004))  //priority mask
 #define GICC_IAR        (*(volatile unsigned int *)(GICC_BASE + 0x00C))  //interrupt acknowledge
 #define GICC_EOIR       (*(volatile unsigned int *)(GICC_BASE + 0x010))  //end of interrupt
+#define GICC_AIAR       (*(volatile unsigned int *)(GICC_BASE + 0x020))  //aliased group1 acknowledge
+#define GICC_AEOIR      (*(volatile unsigned int *)(GICC_BASE + 0x024))  //aliased group1 end of interrupt
 
 // PPI interrupt IDs for ARM generic timers
 #define GIC_PPI_HP_TIMER  26  // hypervisor physical timer
